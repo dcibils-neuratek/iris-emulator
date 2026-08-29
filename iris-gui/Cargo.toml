@@ -1,0 +1,135 @@
+[package]
+name = "iris-gui"
+version = "0.1.0"
+edition = "2021"
+description = "SGI Indy (MIPS R4400) emulator"
+license = "BSD-3-Clause"
+
+[package.metadata.deb]
+maintainer = "Dani Sarfati <dani@funkervogt.com>"
+copyright = "2025 Dani Sarfati"
+license-file = "../LICENSE"
+extended-description = "IRIS emulates an SGI Indy workstation (MIPS R4400) and boots IRIX 6.5 and 5.3 to a usable system with shell, networking, and X11."
+# `$auto` runs dpkg-shlibdeps, which resolves the pcap variant's libpcap link to
+# the correctly-versioned package name for the build's distro — including the
+# Ubuntu 24.04 `t64` rename (libpcap0.8 -> libpcap0.8t64). That's why we DON'T
+# hardcode libpcap here: a literal name would break on noble, and would also be
+# over-broad on the standard/lightning debs that don't link libpcap at all.
+depends = "$auto"
+# PCAP (bridged) networking: setcap the binary at install so it captures without
+# root. See installer/linux/postinst (best-effort; falls back to in-app pkexec).
+maintainer-scripts = "../installer/linux"
+section = "games"
+priority = "optional"
+# Asset source paths are resolved relative to this package dir (iris-gui/),
+# NOT the workspace root — so they must not carry an `iris-gui/` prefix or it
+# doubles to iris-gui/iris-gui/... The `target/...` binary path is special-cased
+# by cargo-deb (rewritten to target/<triple>/release with --target).
+assets = [
+  ["target/release/iris-gui", "usr/bin/iris-gui", "755"],
+  ["assets/icons/icon-256.png", "usr/share/icons/hicolor/256x256/apps/iris-gui.png", "644"],
+  ["assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/iris-gui.png", "644"],
+  ["assets/icons/icon-64.png", "usr/share/icons/hicolor/64x64/apps/iris-gui.png", "644"],
+  ["iris-gui.desktop", "usr/share/applications/iris-gui.desktop", "644"],
+]
+
+[package.metadata.generate-rpm]
+# cargo-generate-rpm does NOT auto-detect shared-lib deps, so list libpcap
+# explicitly for the pcap variant. Harmless on standard/lightning rpms (libpcap
+# is a tiny, near-universal package). The rpm names it `libpcap` on Fedora/RHEL.
+requires = { libpcap = "*" }
+# PCAP: setcap the binary at install so it captures without root (mirrors the deb
+# postinst). Best-effort; capture falls back to the in-app pkexec elevation.
+post_install_script = '''
+if command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_raw,cap_net_admin+eip /usr/bin/iris-gui 2>/dev/null || true
+fi
+'''
+assets = [
+  { source = "target/release/iris-gui", dest = "/usr/bin/iris-gui", mode = "755" },
+  { source = "assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/iris-gui.png", mode = "644" },
+  { source = "iris-gui.desktop", dest = "/usr/share/applications/iris-gui.desktop", mode = "644" },
+]
+
+[features]
+# Pre-compiled / distributed build. Hides developer-only affordances that don't
+# make sense for users running an official binary — currently the iris.toml
+# import/export menu items (the GUI's gui.json machine store is the system of
+# record; iris.toml is only useful alongside the standalone `iris` CLI, i.e. a
+# source checkout). Set by the Release and App Store workflows. A no-op for
+# source builds, where the iris.toml workflow stays available.
+bundled = []
+# Mac App Store distribution build. Implies `bundled`, and additionally hides
+# the CI/Automation config tab (the iris-ci socket is a developer automation
+# feature unusable in the sandbox). Set by .github/workflows/appstore.yml.
+appstore = ["bundled"]
+# PCAP bridged networking. Off by default because it adds a hard build-time
+# dependency on a pcap library (libpcap headers on Unix, a WinPcap-compatible
+# `wpcap` SDK on Windows). When enabled, the Network tab can enumerate host
+# interfaces in a dropdown and the in-process VM can actually bridge onto them.
+# Build with: cargo build -p iris-gui --features pcap
+pcap = ["iris/pcap"]
+# DaynaPort SCSI/Link target — Ethernet over the SCSI bus, selectable per SCSI
+# id on the Disks tab. Off by default: it is only useful with a guest driver
+# (IRIX: github.com/techomancer/irixdayna), and without one the device just sits
+# on the bus. The Disks tab still shows the option in a build without it, with a
+# "rebuild with --features daynaport" warning, so a config stays editable.
+# Build with: cargo build -p iris-gui --features daynaport
+daynaport = ["iris/daynaport"]
+# Vestigial for CPU selection. The R4400/R5000 choice is a runtime setting on
+# the Memory tab (`[machine] cpu`), and both models are compiled into every
+# build — see the note in src/lib.rs. This passthrough remains only so the
+# feature name still resolves for anyone building with it.
+r5k = ["iris/r5k"]
+# YouTube / max in-process perf: lightning (no GDB hot-path) + idle-pause on the
+# embedded iris core. Build with: cargo build -p iris-gui --release --features premiere
+premiere = ["iris/lightning", "iris/idle-pause"]
+# N64 development board (Ultra64) — GIO slot 0 + POSIX shm bridge to an external
+# gopher64. Gates both the core device and this crate's toggle/help window (the
+# `ultra64` field on iris's Config only exists with the core feature on).
+# Build with: cargo build -p iris-gui --features ultra64
+ultra64 = ["iris/ultra64"]
+
+[dependencies]
+# Group A (additive) features are always on for iris-gui so the user can enable
+# them at runtime via the config UI: chd (.chd disk paths), camera (vino source),
+# rex-jit (REX3 draw-shader compiler). They add code paths and native deps but no
+# runtime cost when unused. `ultra64` used to be here too; it is now an opt-in
+# passthrough feature (above), since it needs an external gopher64 to be usable.
+iris = { path = "..", features = ["chd", "camera", "rex-jit"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+# Match iris's winit version — Ps2Controller::push_kb takes
+# winit::keyboard::KeyCode.
+winit = "0.30"
+png = "0.18"
+# rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
+# pulls its own `pollster` executor to block on the portal's async D-Bus calls.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+# Read the host's own interface addresses (Networking tab: first-free subnet
+# presets + overlap warnings). Reads addresses via getifaddrs — no entitlement,
+# and it does not trigger the macOS 15 Local Network prompt (that's for talking
+# *to* LAN peers, not enumerating your own NICs).
+if-addrs = "0.15"
+
+# macOS App Sandbox: NSURL security-scoped bookmarks let the App Store build
+# reopen user-selected disk images / PROMs / ISOs across launches. These crates
+# are already in the build graph (eframe/winit/rfd pull them in); we enable a
+# few extra type features and use them only under `feature = "appstore"`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSURL", "NSData", "NSError", "NSString", "NSArray",
+] }
+
+[[bin]]
+name = "iris-gui"
+path = "src/main.rs"

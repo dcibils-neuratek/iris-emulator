@@ -1,0 +1,1318 @@
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+
+use crate::cow_disk::CowDisk;
+
+/// Get the standard CDB length based on the opcode's group code
+pub fn get_cdb_length(opcode: u8) -> usize {
+    let group = (opcode >> 5) & 0x7;
+    match group {
+        0 => 6,
+        1 | 2 => 10,
+        5 => 12,
+        _ => 6,
+    }
+}
+
+pub mod scsi_cmd {
+    pub const TEST_UNIT_READY: u8 = 0x00;
+    pub const REQUEST_SENSE: u8 = 0x03;
+    pub const FORMAT_UNIT: u8 = 0x04;
+    pub const READ_6: u8 = 0x08;
+    pub const WRITE_6: u8 = 0x0a;
+    pub const INQUIRY: u8 = 0x12;
+    pub const MODE_SELECT_6: u8 = 0x15;
+    pub const MODE_SENSE_6: u8 = 0x1a;
+    pub const START_STOP_UNIT: u8 = 0x1b;
+    pub const RECEIVE_DIAGNOSTIC_RESULTS: u8 = 0x1c;
+    pub const SEND_DIAGNOSTIC: u8 = 0x1d;
+    pub const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1e;
+    pub const READ_CAPACITY_10: u8 = 0x25;
+    pub const READ_10: u8 = 0x28;
+    pub const WRITE_10: u8 = 0x2a;
+    pub const VERIFY_10: u8 = 0x2f;
+    pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const MODE_SENSE_10: u8 = 0x5a;
+    pub const WRITE_BUFFER: u8 = 0x3b;
+    pub const READ_BUFFER: u8 = 0x3c;
+    pub const READ_SUB_CHANNEL: u8 = 0x42;
+    pub const READ_TOC_PMA_ATIP: u8 = 0x43;
+    pub const PLAY_AUDIO_TRACK_INDEX: u8 = 0x48;
+    pub const PAUSE_RESUME: u8 = 0x4b;
+    pub const READ_DISC_INFORMATION: u8 = 0x51;
+    pub const GET_CONFIGURATION: u8 = 0x46;
+    pub const SGI_EJECT: u8 = 0xc4;
+    pub const SGI_HD2CDROM: u8 = 0xc9;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ScsiDataLength {
+    Unlimited,      // For READ - return exact amount requested
+    Fixed(usize),   // For INQUIRY, MODE_SENSE - fit into specific size
+}
+
+pub struct ScsiRequest {
+    pub cdb: Vec<u8>,
+    pub data_len: ScsiDataLength,
+    pub data_in: Option<Vec<u8>>,  // For WRITE commands
+}
+
+pub struct ScsiResponse {
+    pub status: u8,      // 0x00 = Good, 0x02 = Check Condition
+    pub data: Vec<u8>,   // Response data
+}
+
+/// Disk I/O backend: either direct file access or copy-on-write overlay.
+pub enum DiskBackend {
+    /// Direct read-write access to a single file (current default behavior).
+    Direct(File),
+    /// Copy-on-write: base image is read-only, writes go to overlay file.
+    Cow(CowDisk),
+    /// Hard-disk CHD. Writable; compressed parents get an uncompressed
+    /// `.diff.chd` sidecar (MAME-style), so the parent stays untouched.
+    #[cfg(feature = "chd")]
+    ChdHd(crate::chd_disk::ChdHd),
+    /// CD CHD (single-track MODE1) exposed as a 2048-byte/sector read-only
+    /// stream. Writes return an error.
+    #[cfg(feature = "chd")]
+    ChdCd(crate::chd_disk::ChdCd),
+}
+
+impl DiskBackend {
+    /// Read `count` blocks at `lba`, where each block is `block_size` bytes.
+    /// Translates directly to a byte offset: `lba * block_size`.
+    /// COW always uses 512-byte sectors (HDD only, never CD-ROM).
+    fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
+        let byte_offset = lba * block_size;
+        let byte_count = count as u64 * block_size;
+        match self {
+            DiskBackend::Direct(file) => {
+                file.seek(SeekFrom::Start(byte_offset))?;
+                let mut buf = vec![0u8; byte_count as usize];
+                file.read_exact(&mut buf)?;
+                Ok(buf)
+            }
+            DiskBackend::Cow(cow) => {
+                cow.read_sectors(lba, count)
+            }
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.read_blocks(lba, count, block_size),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(cd) => cd.read_blocks(lba, count, block_size),
+        }
+    }
+
+    fn write_sectors(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
+        match self {
+            DiskBackend::Direct(file) => {
+                let offset = lba * 512;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(data)?;
+                Ok(())
+            }
+            DiskBackend::Cow(cow) => cow.write_sectors(lba, data),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.write_sectors(lba, data),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CD CHD is read-only",
+            )),
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            DiskBackend::Direct(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
+            DiskBackend::Cow(cow) => cow.size(),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.size(),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(cd) => cd.size(),
+        }
+    }
+}
+
+/// What kind of target sits at this SCSI id.
+///
+/// `Disk` and `Cdrom` share the storage command set below and differ only in
+/// behaviour (block size, TOC, write protection). `DaynaPort` shares nothing
+/// with them: it is a type-3 Processor device whose vendor command set reuses
+/// the READ(6)/WRITE(6) opcodes for packet RX/TX, so it is dispatched *before*
+/// the storage opcodes in `request()` and must never reach them.
+pub enum DeviceKind {
+    Disk,
+    Cdrom,
+    #[cfg(feature = "daynaport")]
+    DaynaPort(Box<crate::daynaport::DaynaPort>),
+}
+
+pub struct ScsiDevice {
+    /// None = no media loaded (CD-ROM drive present but tray is empty), or a
+    /// device with no storage behind it at all (DaynaPort).
+    /// HDDs are never None in practice.
+    backend: Option<DiskBackend>,
+    /// Capacity in bytes of the loaded media. 0 when `backend` is None.
+    size: u64,
+    kind: DeviceKind,
+    /// Path of the currently mounted image. Empty string when no media.
+    filename: String,
+    /// Full disc list for CD-ROM changers. Index 0 is always the active disc.
+    /// For HDDs this is empty (unused).
+    discs: Vec<String>,
+    buffer: Vec<u8>,  // Internal buffer for WRITE_BUFFER/READ_BUFFER commands
+    pending_sense: [u8; 18],  // Stored sense data, served on REQUEST_SENSE
+    /// Unit Attention pending — set after disc change, cleared on next command.
+    unit_attention: bool,
+    /// Physical sector size: always 2048 for CD-ROM (Yellow Book), 512 for HDD.
+    /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
+    phys_block_size: u64,
+    /// Logical block size: LBA→byte offset = lba * logical_block_size.
+    /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
+    logical_block_size: u64,
+}
+
+const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
+
+impl ScsiDevice {
+    pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
+        Self {
+            backend: Some(backend),
+            size,
+            kind: if is_cdrom { DeviceKind::Cdrom } else { DeviceKind::Disk },
+            filename,
+            discs,
+            buffer: vec![0u8; SCSI_BUFFER_SIZE],
+            pending_sense: [0u8; 18],
+            unit_attention: false,
+            phys_block_size: if is_cdrom { 2048 } else { 512 },
+            // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
+            // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
+            logical_block_size: if is_cdrom { 2048 } else { 512 },
+        }
+    }
+
+    /// Construct an empty CD-ROM drive — drive present, no media inserted.
+    /// IRIX will see the drive in `hinv` but `TEST UNIT READY` reports
+    /// MEDIUM NOT PRESENT.
+    pub fn new_empty_cdrom() -> Self {
+        Self {
+            backend: None,
+            size: 0,
+            kind: DeviceKind::Cdrom,
+            filename: String::new(),
+            discs: vec![],
+            buffer: vec![0u8; SCSI_BUFFER_SIZE],
+            pending_sense: [0u8; 18],
+            unit_attention: false,
+            phys_block_size: 2048,
+            logical_block_size: 2048,
+        }
+    }
+
+    /// Construct a DaynaPort SCSI/Link target — a type-3 Processor device with
+    /// no storage backing at all (no image, no CHD, no overlay).
+    #[cfg(feature = "daynaport")]
+    pub fn new_daynaport(dp: crate::daynaport::DaynaPort) -> Self {
+        Self {
+            backend: None,
+            size: 0,
+            kind: DeviceKind::DaynaPort(Box::new(dp)),
+            filename: String::new(),
+            discs: vec![],
+            buffer: Vec::new(),
+            pending_sense: [0u8; 18],
+            unit_attention: false,
+            phys_block_size: 512,
+            logical_block_size: 512,
+        }
+    }
+
+    /// The DaynaPort behind this target, if it is one.
+    #[cfg(feature = "daynaport")]
+    pub fn daynaport_mut(&mut self) -> Option<&mut crate::daynaport::DaynaPort> {
+        match &mut self.kind {
+            DeviceKind::DaynaPort(dp) => Some(dp),
+            _ => None,
+        }
+    }
+
+    /// The DaynaPort behind this target, if it is one.
+    #[cfg(feature = "daynaport")]
+    pub fn daynaport(&self) -> Option<&crate::daynaport::DaynaPort> {
+        match &self.kind {
+            DeviceKind::DaynaPort(dp) => Some(dp),
+            _ => None,
+        }
+    }
+
+    /// True for a DaynaPort SCSI/Link target. Callers on the storage path use
+    /// this to skip block-oriented handling (the controller, for instance, must
+    /// not read a WRITE(6) byte count as `blocks × 512`).
+    pub fn is_daynaport(&self) -> bool {
+        #[cfg(feature = "daynaport")]
+        { matches!(self.kind, DeviceKind::DaynaPort(_)) }
+        #[cfg(not(feature = "daynaport"))]
+        { false }
+    }
+
+    /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
+    /// false when the tray is empty.
+    pub fn has_media(&self) -> bool { self.backend.is_some() }
+
+    /// Mount media on a previously-empty CD-ROM, or swap the disc on a
+    /// loaded one. Sets `unit_attention` so the guest re-reads capacity.
+    pub fn insert_media(&mut self, path: &str) -> io::Result<()> {
+        let f = OpenOptions::new().read(true).open(path)?;
+        let size = f.metadata()?.len();
+        self.backend = Some(DiskBackend::Direct(f));
+        self.size = size;
+        self.filename = path.to_string();
+        self.unit_attention = true;
+        Ok(())
+    }
+
+    /// Unload media from a CD-ROM (tray empty).
+    pub fn unload_media(&mut self) {
+        self.backend = None;
+        self.size = 0;
+        self.filename = String::new();
+        self.unit_attention = true;
+    }
+
+    /// Commit the COW overlay into the base image ("apply the changes"). For a
+    /// raw overlay this copies the dirty sectors in place; for a CHD it rebuilds
+    /// the base from the diff (recompressing) and reopens a fresh overlay. No-op
+    /// if not overlaid. Returns a coarse count of what was committed.
+    pub fn cow_commit(&mut self) -> io::Result<usize> {
+        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
+            return cow.commit();
+        }
+        #[cfg(feature = "chd")]
+        {
+            // CHD: rebuild needs the file closed first, so extract the paths,
+            // drop the backend, flatten, then reopen with the same COW mode.
+            let info = match &self.backend {
+                Some(DiskBackend::ChdHd(hd)) if hd.diff_dirty() => {
+                    hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow()))
+                }
+                _ => None,
+            };
+            if let Some((base, diff, cow)) = info {
+                self.backend = None;
+                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
+                let base_str = base.to_str()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
+                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
+                self.backend = Some(DiskBackend::ChdHd(reopened));
+                return Ok(1);
+            }
+        }
+        Ok(0)
+    }
+
+    /// Reset the COW overlay — discard all uncommitted writes ("roll back"). For
+    /// a raw overlay this truncates it; for a CHD it deletes the `.diff.chd` and
+    /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
+    pub fn cow_reset(&mut self) -> io::Result<()> {
+        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
+            return cow.reset_overlay();
+        }
+        #[cfg(feature = "chd")]
+        {
+            let info = match &self.backend {
+                Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow())),
+                _ => None,
+            };
+            if let Some((base, diff, cow)) = info {
+                self.backend = None;
+                let _ = std::fs::remove_file(&diff); // discard every overlay write
+                let base_str = base.to_str()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
+                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
+                self.backend = Some(DiskBackend::ChdHd(reopened));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy the COW overlay into `dest` and return its dirty sector set.
+    /// Direct-mode / no-media devices return an empty list and create no file.
+    pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
+        match &mut self.backend {
+            Some(DiskBackend::Cow(cow)) => cow.export_overlay(dest),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Replace the COW overlay with the contents of `source` and adopt
+    /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
+    pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
+        match &mut self.backend {
+            Some(DiskBackend::Cow(cow)) => cow.import_overlay(source, dirty),
+            _ => Ok(()),
+        }
+    }
+
+    /// Number of dirty sectors in the COW overlay (raw), or for a CHD a coarse
+    /// 1/0 "has uncommitted changes" (we don't track per-sector dirt there).
+    /// 0 if direct / no media.
+    pub fn cow_dirty_count(&self) -> usize {
+        match &self.backend {
+            Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
+            #[cfg(feature = "chd")]
+            Some(DiskBackend::ChdHd(hd)) => usize::from(hd.diff_dirty()),
+            _ => 0,
+        }
+    }
+
+    /// Whether this device has a copy-on-write overlay (a raw `.overlay` or a CHD
+    /// `.diff.chd`) that `cow commit` / `cow reset` can act on.
+    pub fn is_cow(&self) -> bool {
+        match &self.backend {
+            Some(DiskBackend::Cow(_)) => true,
+            #[cfg(feature = "chd")]
+            Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().is_some(),
+            _ => false,
+        }
+    }
+
+    /// `(base, diff)` paths if this device is a CHD writing to a `.diff.chd`
+    /// sidecar that holds changes worth folding back into the base on a clean
+    /// shutdown. `None` for in-place / non-CHD / no-media devices.
+    pub fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        #[cfg(feature = "chd")]
+        {
+            if let Some(DiskBackend::ChdHd(hd)) = &self.backend {
+                return hd.pending_sync();
+            }
+        }
+        None
+    }
+
+    /// Take the pending-sync paths AND release the disk backend, closing the CHD
+    /// so the base can be atomically rebuilt by `chd_disk::flatten_diff`. Returns
+    /// `None` and leaves the backend in place when there's nothing to sync.
+    pub fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let pending = self.pending_chd_sync();
+        if pending.is_some() {
+            self.backend = None;
+        }
+        pending
+    }
+
+    /// Eject the current disc. Behaviour depends on how many discs are queued:
+    ///   - 0 or 1 disc: the tray empties (drive present, no media).
+    ///   - 2+ discs: cycle to the next disc in the changer list (wraps around).
+    /// Returns the newly-active disc path, or None when the tray is emptied or
+    /// this is not a CD-ROM.
+    pub fn eject_next(&mut self) -> Option<String> {
+        if !self.is_cdrom() {
+            return None;
+        }
+        // 0 or 1 disc: eject empties the tray entirely.
+        if self.discs.len() <= 1 {
+            let prev_disc = self.filename.clone();
+            self.unload_media();
+            self.discs.clear(); // no phantom entries remain
+            if !prev_disc.is_empty() {
+                eprintln!("CD-ROM: ejected '{}', tray empty", prev_disc);
+            }
+            return None;
+        }
+        // Rotate: move front to back, new front becomes active.
+        let current = self.discs.remove(0);
+        self.discs.push(current);
+        let next_path = self.discs[0].clone();
+
+        match OpenOptions::new().read(true).open(&next_path) {
+            Ok(f) => {
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                self.backend = Some(DiskBackend::Direct(f));
+                self.size = size;
+                // phys_block_size never changes — CD-ROM physical sectors are always 2048.
+                // Do NOT reset logical_block_size — MODE SELECT is a controller setting
+                // that persists across disc changes, just like on real hardware.
+                self.filename = next_path.clone();
+                self.unit_attention = true; // signal medium change on next command
+                eprintln!("CD-ROM changer: switched to '{}'", next_path);
+                Some(next_path)
+            }
+            Err(e) => {
+                eprintln!("SCSI eject: could not open {}: {}", next_path, e);
+                None
+            }
+        }
+    }
+
+    pub fn is_cdrom(&self) -> bool { matches!(self.kind, DeviceKind::Cdrom) }
+
+    /// Current active disc path (for display / status).
+    pub fn current_disc(&self) -> &str {
+        &self.filename
+    }
+
+    /// All discs in the changer list.
+    pub fn disc_list(&self) -> &[String] {
+        &self.discs
+    }
+
+    /// Load an explicit image path and make it the active disc immediately,
+    /// as if a hand swapped the disc in the drive. The path is inserted at the
+    /// front of the changer list (becomes index 0) and a medium-change is
+    /// signalled (unit attention) so the guest re-reads the TOC on its next
+    /// command. The image is opened as a raw ISO (`Direct` backend), matching
+    /// the changer's eject path. Err if this is not a CD-ROM or the file can't
+    /// be opened.
+    ///
+    /// Queue management by disc count:
+    ///   - 0 discs (empty tray): the new disc becomes the sole entry.
+    ///   - 1 disc: the existing disc is kept in the queue (pushed to index 1)
+    ///     and the new disc becomes active at index 0, growing the queue to 2
+    ///     so that eject cycles rather than emptying the tray.
+    ///   - 2+ discs: the new disc is placed at index 0 (active); if it was
+    ///     already queued it is moved to the front rather than duplicated.
+    pub fn load_disc(&mut self, path: String) -> Result<String, String> {
+        if !self.is_cdrom() {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        let f = OpenOptions::new().read(true).open(&path)
+            .map_err(|e| format!("could not open {}: {}", path, e))?;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        self.backend = Some(DiskBackend::Direct(f));
+        self.size = size;
+        self.filename = path.clone();
+        self.unit_attention = true;
+
+        match self.discs.len() {
+            // Empty tray: new disc is the only entry.
+            0 => self.discs.push(path.clone()),
+            // One disc already loaded: keep it queued at index 1 so eject
+            // cycles between the two instead of emptying the tray.
+            1 => {
+                if self.discs[0] != path {
+                    // Push the current disc to the back, new disc goes to front.
+                    self.discs.insert(0, path.clone());
+                }
+                // If same path, nothing to change — already loaded.
+            }
+            // 2+ discs: make new disc active at front, dedup if already queued.
+            _ => {
+                if let Some(pos) = self.discs.iter().position(|d| d == &path) {
+                    self.discs.remove(pos);
+                }
+                self.discs.insert(0, path.clone());
+            }
+        }
+        Ok(path)
+    }
+
+    /// Insert a new disc path at position 1 (next after current).
+    /// Returns Err if this is not a CD-ROM or the path doesn't exist.
+    pub fn add_disc(&mut self, path: String) -> Result<(), String> {
+        if !self.is_cdrom() {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        if !std::path::Path::new(&path).exists() {
+            return Err(format!("File not found: {}", path));
+        }
+        // Insert at index 1 so it becomes the next disc after eject.
+        let insert_pos = if self.discs.is_empty() { 0 } else { 1 };
+        self.discs.insert(insert_pos, path);
+        Ok(())
+    }
+
+    /// Remove disc at the given ordinal index.
+    /// Removing index 0 (current) does not eject — it only removes the path.
+    /// Returns Err if index is out of range.
+    pub fn remove_disc(&mut self, ordinal: usize) -> Result<String, String> {
+        if !self.is_cdrom() {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        if ordinal >= self.discs.len() {
+            return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
+        }
+        Ok(self.discs.remove(ordinal))
+    }
+
+    /// Move disc at `ordinal` to index 1 (next after current).
+    /// If ordinal is 0 (active), returns Err.
+    pub fn move_disc_next(&mut self, ordinal: usize) -> Result<(), String> {
+        if !self.is_cdrom() {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        if ordinal == 0 {
+            return Err("Ordinal 0 is the active disc; use 'scsi eject' to advance".to_string());
+        }
+        if ordinal >= self.discs.len() {
+            return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
+        }
+        if self.discs.len() < 2 {
+            return Ok(()); // already only entry
+        }
+        let path = self.discs.remove(ordinal);
+        // Insert at position 1 (right after the active disc at 0).
+        self.discs.insert(1, path);
+        Ok(())
+    }
+
+    /// (physical_block_size, logical_block_size)
+    pub fn block_sizes(&self) -> (u64, u64) {
+        (self.phys_block_size, self.logical_block_size)
+    }
+
+    fn set_sense(&mut self, key: u8, asc: u8, ascq: u8) {
+        self.pending_sense = [0u8; 18];
+        self.pending_sense[0] = 0x70; // Current error
+        self.pending_sense[2] = key;
+        self.pending_sense[7] = 10;   // Additional length
+        self.pending_sense[12] = asc;
+        self.pending_sense[13] = ascq;
+    }
+
+    fn check_condition(&mut self, key: u8, asc: u8, ascq: u8) -> ScsiResponse {
+        self.set_sense(key, asc, ascq);
+        ScsiResponse { status: 0x02, data: vec![] }
+    }
+
+    pub fn request(&mut self, req: &ScsiRequest) -> Result<ScsiResponse, std::io::Error> {
+        if req.cdb.is_empty() {
+            return Ok(self.check_condition(0x05, 0x20, 0x00)); // Illegal Request: Invalid command
+        }
+
+        let lun = (req.cdb[1] >> 5) & 0x7;
+
+        // For most commands, only LUN 0 is valid
+        if lun != 0 && req.cdb[0] != scsi_cmd::INQUIRY && req.cdb[0] != scsi_cmd::REQUEST_SENSE {
+            return Ok(self.check_condition(0x05, 0x25, 0x00)); // Illegal Request: LUN Not Supported
+        }
+
+        // Unit attention fires before any other command (except REQUEST_SENSE/INQUIRY).
+        if self.unit_attention
+            && req.cdb[0] != scsi_cmd::REQUEST_SENSE
+            && req.cdb[0] != scsi_cmd::INQUIRY
+        {
+            self.unit_attention = false;
+            return Ok(self.check_condition(0x06, 0x28, 0x00));
+        }
+
+        // A DaynaPort answers its own vendor command set, which reuses the
+        // READ(6) (0x08) and WRITE(6) (0x0a) opcodes for packet RX/TX. Dispatch
+        // it here, ahead of the storage match below, or those two would be
+        // read as disk block transfers. It answers no storage command at all —
+        // not READ CAPACITY, not MODE SENSE, not READ TOC.
+        #[cfg(feature = "daynaport")]
+        if let DeviceKind::DaynaPort(dp) = &mut self.kind {
+            let mut response = dp.request(req)?;
+            if let ScsiDataLength::Fixed(max_len) = req.data_len {
+                response.data.truncate(max_len.min(response.data.len()));
+            }
+            return Ok(response);
+        }
+
+        let mut response = match req.cdb[0] {
+            scsi_cmd::TEST_UNIT_READY => self.exec_test_unit_ready(&req.cdb)?,
+            scsi_cmd::REQUEST_SENSE => self.exec_request_sense(&req.cdb)?,
+            scsi_cmd::INQUIRY => self.exec_inquiry(&req.cdb)?,
+            scsi_cmd::READ_CAPACITY_10 => self.exec_read_capacity_10(&req.cdb)?,
+            scsi_cmd::READ_6 => self.exec_read_6(&req.cdb)?,
+            scsi_cmd::READ_10 => self.exec_read_10(&req.cdb)?,
+            scsi_cmd::WRITE_6 => self.exec_write_6(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::WRITE_10 => self.exec_write_10(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::START_STOP_UNIT => self.exec_start_stop_unit(&req.cdb)?,
+            scsi_cmd::MODE_SENSE_6 => self.exec_mode_sense_6(&req.cdb)?,
+            scsi_cmd::MODE_SENSE_10 => self.exec_mode_sense_10(&req.cdb)?,
+            scsi_cmd::WRITE_BUFFER => self.exec_write_buffer(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
+            scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
+            scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
+            // No write-back cache to flush — our backend writes are already synchronous.
+            scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
+            scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
+            scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
+            scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
+            scsi_cmd::SGI_HD2CDROM => self.exec_sgi_hd2cdrom(&req.cdb)?,
+            _ => {
+                eprintln!("SCSI: Unimplemented command {:02x} cdb={:02x?}", req.cdb[0], &req.cdb);
+                self.check_condition(0x05, 0x20, 0x00) // Illegal Request: Invalid Command Operation Code
+            }
+        };
+
+        // Handle data_len parameter
+        if let ScsiDataLength::Fixed(max_len) = req.data_len {
+            if response.data.len() > max_len {
+                response.data.truncate(max_len);
+            }
+        }
+
+        Ok(response)
+    }
+
+    fn exec_test_unit_ready(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if self.unit_attention {
+            self.unit_attention = false;
+            // Sense key 0x06 UNIT_ATTENTION, ASC 0x28 "Not Ready to Ready Transition / Medium Changed"
+            return Ok(self.check_condition(0x06, 0x28, 0x00));
+        }
+        if self.backend.is_none() {
+            // Sense key 0x02 NOT_READY, ASC 0x3A "Medium not present"
+            return Ok(self.check_condition(0x02, 0x3A, 0x00));
+        }
+        Ok(ScsiResponse {
+            status: 0x00,
+            data: vec![],
+        })
+    }
+
+    fn exec_request_sense(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let alloc_len = cdb[4] as usize;
+        // Return stored sense data and clear it
+        let sense = self.pending_sense;
+        self.pending_sense = [0u8; 18];
+        self.pending_sense[0] = 0x70; // Leave valid response code for next time
+        let data = sense[..sense.len().min(alloc_len.max(18))].to_vec();
+        Ok(ScsiResponse { status: 0x00, data })
+    }
+
+    fn exec_inquiry(&self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let alloc_len = cdb[4] as usize;
+        let mut data = vec![0u8; 36];
+        let lun = (cdb[1] >> 5) & 0x7;
+
+        if lun == 0 {
+            data[0] = if self.is_cdrom() { 0x05 } else { 0x00 };
+            data[1] = if self.is_cdrom() { 0x80 } else { 0x00 }; // RMB (Removable)
+            data[2] = 0x02; // ANSI SCSI-2
+            data[3] = 0x02; // SCSI-2 response format
+            data[4] = 31;   // Additional length (36 - 5)
+            if self.is_cdrom() {
+                // Match Sony CDU-76S — SGI Indy shipped with this drive and IRIX mediad
+                // uses the vendor/product strings for feature detection (volume control, eject).
+                data[8..16].copy_from_slice(b"Sony    ");
+                data[16..32].copy_from_slice(b"CDU-76S         ");
+            } else {
+                data[8..16].copy_from_slice(b"SGI     ");
+                data[16..32].copy_from_slice(b"IRIS EMUL DISK  ");
+            }
+            let rev = b"1.0 ";
+            data[32..36].copy_from_slice(rev);
+
+            /*println!("SCSI: INQUIRY LUN={} AllcLen={} Type={:02x} Vendor={} Product={} Rev={}",
+                lun, alloc_len, data[0],
+                String::from_utf8_lossy(&data[8..16]),
+                String::from_utf8_lossy(&data[16..32]),
+                String::from_utf8_lossy(&data[32..36]))*/
+        } else {
+            // SPC-2 8.2.5: PQ=011b (device server not capable of supporting a physical
+            // device on this LUN), PDT=0x1F (unknown/no device type). Linux's
+            // scsi_scan.c treats this as SCSI_SCAN_TARGET_PRESENT and stops probing
+            // further LUNs on this target instead of registering a phantom disk.
+            data[0] = 0x7F;
+            data[2] = 0x02; // ANSI SCSI-2
+            data[3] = 0x02; // SCSI-2 response format
+            data[4] = 31;   // Additional length (36 - 5)
+        }
+
+        data.truncate(alloc_len);
+        Ok(ScsiResponse {
+            status: 0x00,
+            data,
+        })
+    }
+
+    fn exec_read_capacity_10(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if self.backend.is_none() {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
+        let block_size = self.logical_block_size as u32;
+        let last_lba = (self.size / self.logical_block_size).saturating_sub(1) as u32;
+        //eprintln!("SCSI READ CAPACITY: block_size={} last_lba={} data={:02x?}", block_size, last_lba, &[last_lba.to_be_bytes(), block_size.to_be_bytes()].concat());
+
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&last_lba.to_be_bytes());
+        data[4..8].copy_from_slice(&block_size.to_be_bytes());
+
+        Ok(ScsiResponse {
+            status: 0x00,
+            data,
+        })
+    }
+
+    fn exec_read_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let lba = (((cdb[1] & 0x1F) as u64) << 16) | ((cdb[2] as u64) << 8) | (cdb[3] as u64);
+        let count = if cdb[4] == 0 { 256 } else { cdb[4] as usize };
+        self.perform_read(lba, count)
+    }
+
+    fn exec_read_10(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let lba = ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16) | ((cdb[4] as u64) << 8) | (cdb[5] as u64);
+        let count = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
+        self.perform_read(lba, count)
+    }
+
+    fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        };
+        // Check LBA bounds before attempting I/O
+        let last_lba = self.size / self.logical_block_size;
+        if count > 0 && (lba >= last_lba || lba + count as u64 > last_lba) {
+            return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
+        }
+        let data = backend.read_blocks(lba, count, self.logical_block_size)?;
+        let expected = count as u64 * self.logical_block_size;
+        if data.len() as u64 != expected {
+            eprintln!(
+                "SCSI READ mismatch: lba={} count={} block_size={} expected {} bytes got {} bytes",
+                lba, count, self.logical_block_size, expected, data.len()
+            );
+        }
+        Ok(ScsiResponse {
+            status: 0x00,
+            data,
+        })
+    }
+
+    fn exec_write_6(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        let lba = (((cdb[1] & 0x1F) as u64) << 16) | ((cdb[2] as u64) << 8) | (cdb[3] as u64);
+        let count = if cdb[4] == 0 { 256 } else { cdb[4] as usize };
+        self.perform_write(lba, count, data_in)
+    }
+
+    fn exec_write_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        let lba = ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16) | ((cdb[4] as u64) << 8) | (cdb[5] as u64);
+        let count = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
+        self.perform_write(lba, count, data_in)
+    }
+
+    fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        if self.is_cdrom() {
+            return Ok(ScsiResponse {
+                status: 0x02, // Check Condition
+                data: vec![],
+            });
+        }
+
+        let Some(data) = data_in else {
+            return Ok(ScsiResponse {
+                status: 0x02,
+                data: vec![],
+            });
+        };
+
+        let expected_len = count as u64 * self.logical_block_size;
+        if data.len() as u64 != expected_len {
+            return Ok(ScsiResponse {
+                status: 0x02,
+                data: vec![],
+            });
+        }
+
+        // Writes always go through as 512-byte sectors (HDD path only, phys=logical=512)
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00));
+        };
+        backend.write_sectors(lba, data)?;
+
+        Ok(ScsiResponse {
+            status: 0x00,
+            data: vec![],
+        })
+    }
+
+    fn exec_start_stop_unit(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        // Byte 4: bit1=LOEJ, bit0=START
+        let loej  = (cdb[4] & 0x02) != 0;
+        let start = (cdb[4] & 0x01) != 0;
+        if loej && !start && self.is_cdrom() {
+            // Eject requested. eject_next() handles the count-driven cases:
+            // 0/1 disc empties the tray; 2+ discs cycle to the next.
+            self.eject_next();
+        }
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// Builds the block descriptor and concatenated mode pages shared by
+    /// MODE SENSE (6) and MODE SENSE (10) — only the header framing differs
+    /// between the two commands.
+    fn build_mode_sense_pages(&mut self, page_code: u8, dbd: bool) -> Result<(Vec<u8>, Vec<u8>), ScsiResponse> {
+        // Reject HDD-only pages when operating as CDROM.
+        // sd.c asks for page 8 (Caching) — CDROMs don't support it.
+        // Returning a page-8-incompatible response triggers the noisy
+        // "Got wrong page" path; CHECK CONDITION with ASC 0x24 hits the
+        // clean "Cache data unavailable" / "bad_sense" path instead.
+        if self.is_cdrom() && matches!(page_code, 0x08 | 0x03 | 0x04) {
+            return Err(self.check_condition(0x05, 0x24, 0x00)); // Illegal Request: Invalid field in CDB
+        }
+
+        let lbs = self.logical_block_size as u32;
+
+        // Block descriptor (8 bytes) — omitted if DBD set
+        let block_desc: Vec<u8> = if dbd {
+            vec![]
+        } else {
+            let total_blocks = (self.size / self.logical_block_size) as u32;
+            vec![
+                0x00,                               // density code
+                (total_blocks >> 16) as u8,
+                (total_blocks >> 8)  as u8,
+                (total_blocks)       as u8,
+                0x00,                               // reserved
+                (lbs >> 16) as u8,
+                (lbs >> 8)  as u8,
+                (lbs)       as u8,
+            ]
+        };
+
+        // Synthesize geometry from disk size (HDD pages only)
+        let heads: u32 = 16;
+        let spt: u32 = 63;
+        let total_blocks_u64 = self.size / self.logical_block_size;
+        let cylinders = ((total_blocks_u64 + (heads * spt - 1) as u64) / (heads * spt) as u64) as u32;
+
+        let mut pages: Vec<u8> = Vec::new();
+        let want_page = |pc: u8| page_code == 0x3F || page_code == pc;
+
+        // Page 0x01: Error Recovery Parameters
+        if want_page(0x01) {
+            pages.extend_from_slice(&[
+                0x01, 0x0A, // page code, length
+                0x00,       // AWRE=0, ARRE=0, TB=0, RC=0, EER=0, PER=0, DTE=0, DCR=0
+                0x01,       // Read retry count
+                0x00, 0x00, 0x00, 0x00, // Correction span, head offset, data strobe offset, reserved
+                0x01,       // Write retry count
+                0x00, 0x00, 0x00, // Reserved, recovery time limit (MSB, LSB)
+            ]);
+        }
+
+        // Page 0x2a: CD Capabilities and Mechanical Status (MMC, CD-ROM only)
+        // sr.c reads this to determine drive speed and capabilities.
+        // Return minimal read-only CD-ROM capabilities at 4x speed.
+        if self.is_cdrom() && want_page(0x2a) {
+            pages.extend_from_slice(&[
+                0x2a, 0x12,             // page code, length (18 bytes follow)
+                0x00, 0x00,             // methods 1/2 not supported
+                0x71, 0x00,             // read capabilities: CD-R/RW readable, audio, composite, digital port
+                0x00, 0x00,             // write capabilities: none
+                0x01, 0x00,             // max read speed: 706kB/s (4x)
+                0x00, 0x00,             // # of volume levels: 0
+                0x00, 0x00,             // buffer size: 0
+                0x01, 0x00,             // current read speed: 4x
+                0x00,                   // reserved
+                0x00,                   // BCK/LSBF/RCK/LRCK flags
+                0x00, 0x00,             // max write speed: 0
+                0x00, 0x00,             // current write speed: 0
+            ]);
+        }
+
+        // Page 0x0e: CD Audio Control (CD-ROM only) — required by IRIX mediad
+        if self.is_cdrom() && want_page(0x0e) {
+            pages.extend_from_slice(&[
+                0x0e, 0x0e,         // page code, length
+                0x04,               // IMMED=1
+                0x00,               // reserved
+                0x00, 0x00,         // reserved
+                0x00, 0x4b,         // logical blocks per second of audio (75)
+                // Port 0: channel select=1 (left), volume=0xff
+                0x01, 0xff,
+                // Port 1: channel select=2 (right), volume=0xff
+                0x02, 0xff,
+                // Port 2 & 3: muted
+                0x00, 0x00,
+                0x00, 0x00,
+            ]);
+        }
+
+        // Pages 0x03/0x04 are HDD-only (rigid disk geometry)
+        if !self.is_cdrom() {
+            // Page 0x03: Format Parameters
+            if want_page(0x03) {
+                let bps = lbs as u16;
+                pages.extend_from_slice(&[
+                    0x03, 0x16, // page code, length
+                    0x00, 0x00, // tracks per zone
+                    0x00, 0x00, // alternate sectors per zone
+                    0x00, 0x00, // alternate tracks per zone
+                    0x00, 0x00, // alternate tracks per logical unit
+                    (spt >> 8) as u8, (spt & 0xFF) as u8, // sectors per track
+                    (bps >> 8) as u8, (bps & 0xFF) as u8, // data bytes per physical sector
+                    0x00, 0x01, // interleave
+                    0x00, 0x00, // track skew factor
+                    0x00, 0x00, // cylinder skew factor
+                    0x00,       // SSEC=0, HSEC=0, RMB=0, SURF=0
+                    0x00, 0x00, 0x00, // reserved
+                ]);
+            }
+
+            // Page 0x04: Rigid Disk Geometry
+            if want_page(0x04) {
+                let cyl = cylinders;
+                pages.extend_from_slice(&[
+                    0x04, 0x16, // page code, length
+                    (cyl >> 16) as u8, (cyl >> 8) as u8, (cyl & 0xFF) as u8, // number of cylinders
+                    heads as u8, // number of heads
+                    0x00, 0x00, 0x00, // starting cylinder - write precomp
+                    0x00, 0x00, 0x00, // starting cylinder - reduced write current
+                    0x00, 0x00, // drive step rate
+                    0x00, 0x00, 0x00, // landing zone cylinder
+                    0x00,       // RPL
+                    0x00,       // rotational offset
+                    0x00,       // reserved
+                    0x1C, 0x20, // medium rotation rate (7200 RPM)
+                    0x00, 0x00, // reserved
+                ]);
+            }
+
+            // Page 0x08: Caching Parameters (SBC-2 / SCSI-2). Without this, sd.c logs
+            // "No Caching mode page found" / "Assuming drive cache: write through".
+            if want_page(0x08) {
+                pages.extend_from_slice(&[
+                    0x08, 0x12, // page code, length (18 bytes follow)
+                    0x04,       // WCE=1 (write-back), RCD=0 (read cache enabled)
+                    0x00,       // demand read/write retention priority
+                    0x00, 0x00, // disable pre-fetch transfer length
+                    0x00, 0x00, // minimum pre-fetch
+                    0xff, 0xff, // maximum pre-fetch
+                    0xff, 0xff, // maximum pre-fetch ceiling
+                    0x00,       // FSW/LBCSS/DRA
+                    0x00,       // number of cache segments
+                    0x00, 0x00, // cache segment size
+                    0x00,       // reserved
+                    0x00, 0x00, 0x00, // non-cache segment size
+                ]);
+            }
+        }
+
+        Ok((block_desc, pages))
+    }
+
+    fn exec_mode_sense_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let page_code = cdb[2] & 0x3F;
+        let dbd       = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
+        let alloc_len = cdb[4] as usize;
+
+        let (block_desc, pages) = match self.build_mode_sense_pages(page_code, dbd) {
+            Ok(v) => v,
+            Err(response) => return Ok(response),
+        };
+
+        // Mode Parameter Header (4 bytes) + block descriptor + pages
+        let bd_len = block_desc.len();
+        let total_len = 4 + bd_len + pages.len();
+        let mut data = vec![0u8; total_len];
+        data[0] = (total_len - 1) as u8; // Mode Data Length (excludes byte 0)
+        data[1] = if self.is_cdrom() { 0x01 } else { 0x00 }; // Medium type (0x01 = 120mm optical for CD-ROM)
+        data[2] = if self.is_cdrom() { 0x80 } else { 0x00 }; // WP bit for CD-ROM (read-only media)
+        data[3] = bd_len as u8;
+        data[4..4 + bd_len].copy_from_slice(&block_desc);
+        data[4 + bd_len..].copy_from_slice(&pages);
+
+        data.truncate(alloc_len);
+        Ok(ScsiResponse { status: 0x00, data })
+    }
+
+    fn exec_mode_sense_10(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let page_code = cdb[2] & 0x3F;
+        let dbd       = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
+        let alloc_len = (((cdb[7] as usize) << 8) | (cdb[8] as usize)).min(65535);
+
+        let (block_desc, pages) = match self.build_mode_sense_pages(page_code, dbd) {
+            Ok(v) => v,
+            Err(response) => return Ok(response),
+        };
+
+        // Mode Parameter Header (8 bytes) + block descriptor + pages
+        let bd_len = block_desc.len();
+        let total_len = 8 + bd_len + pages.len();
+        let mut data = vec![0u8; total_len];
+        let mode_data_len = (total_len - 2) as u16; // excludes the length field itself
+        data[0] = (mode_data_len >> 8) as u8;
+        data[1] = (mode_data_len & 0xFF) as u8;
+        data[2] = if self.is_cdrom() { 0x01 } else { 0x00 }; // Medium type
+        data[3] = if self.is_cdrom() { 0x80 } else { 0x00 }; // WP bit for CD-ROM (read-only media)
+        // data[4..6] = 0 (reserved / LONGLBA)
+        data[6] = (bd_len >> 8) as u8;
+        data[7] = (bd_len & 0xFF) as u8;
+        data[8..8 + bd_len].copy_from_slice(&block_desc);
+        data[8 + bd_len..].copy_from_slice(&pages);
+
+        data.truncate(alloc_len);
+        Ok(ScsiResponse { status: 0x00, data })
+    }
+
+    fn exec_mode_select_6(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        // Byte 1: SP (Save Pages) bit — we ignore it
+        // Parameter list length is in byte 4
+        let param_len = cdb[4] as usize;
+        let Some(data) = data_in else {
+            return Ok(ScsiResponse { status: 0x00, data: vec![] });
+        };
+        if data.len() < param_len || param_len < 4 {
+            return Ok(ScsiResponse { status: 0x00, data: vec![] });
+        }
+
+        // Header: byte 0 = mode data length (ignored on SELECT), byte 3 = block descriptor length
+        let bd_len = data[3] as usize;
+        if bd_len >= 8 && data.len() >= 4 + bd_len {
+            // 8-byte block descriptor layout (starts at data[4]):
+            //   [0]    density code
+            //   [1..3] number of blocks (0 = whole medium)
+            //   [4]    reserved
+            //   [5..7] block length (24-bit big-endian)
+            let desc = &data[4..4 + bd_len];
+            let new_lbs = ((desc[5] as u64) << 16) | ((desc[6] as u64) << 8) | (desc[7] as u64);
+            if new_lbs == 512 || new_lbs == 2048 {
+                self.logical_block_size = new_lbs;
+            }
+        }
+
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    fn exec_write_buffer(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        // WRITE BUFFER command
+        // Mode field is in bits 0-4 of byte 1
+        let mode = cdb[1] & 0x1F;
+        // Buffer ID is in byte 2
+        let _buffer_id = cdb[2];
+        // Buffer offset is in bytes 3-5 (24-bit)
+        let offset = ((cdb[3] as usize) << 16) | ((cdb[4] as usize) << 8) | (cdb[5] as usize);
+        // Parameter list length is in bytes 6-8 (24-bit)
+        let length = ((cdb[6] as usize) << 16) | ((cdb[7] as usize) << 8) | (cdb[8] as usize);
+
+        match mode {
+            0x00 | 0x01 | 0x02 => {
+                // Mode 0x00: Combined header and data (4-byte header + data)
+                // Mode 0x01: Vendor specific (treat as data mode)
+                // Mode 0x02: Data mode
+                if let Some(data) = data_in {
+                    // Mode 0x00 includes a 4-byte header that we skip
+                    let data_offset = if mode == 0x00 { 4 } else { 0 };
+                    let actual_data = &data[data_offset..];
+                    let actual_length = length.saturating_sub(data_offset);
+
+                    // Verify offset and length are valid
+                    if offset + actual_length <= SCSI_BUFFER_SIZE && actual_data.len() >= actual_length {
+                        // Copy data into internal buffer
+                        self.buffer[offset..offset + actual_length].copy_from_slice(&actual_data[..actual_length]);
+                    } else {
+                        // Invalid offset/length - return check condition
+                        return Ok(ScsiResponse {
+                            status: 0x02,
+                            data: vec![],
+                        });
+                    }
+                }
+
+                Ok(ScsiResponse {
+                    status: 0x00,
+                    data: vec![],
+                })
+            }
+            _ => {
+                // Unsupported mode (descriptor mode 0x03 is read-only, modes 0x04-0x07 are microcode)
+                Ok(ScsiResponse {
+                    status: 0x02,
+                    data: vec![],
+                })
+            }
+        }
+    }
+
+    fn exec_read_buffer(&self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        // READ BUFFER command
+        // Mode field is in bits 0-4 of byte 1
+        let mode = cdb[1] & 0x1F;
+        // Buffer ID is in byte 2
+        let _buffer_id = cdb[2];
+        // Buffer offset is in bytes 3-5 (24-bit)
+        let offset = ((cdb[3] as usize) << 16) | ((cdb[4] as usize) << 8) | (cdb[5] as usize);
+        // Allocation length is in bytes 6-8 (24-bit)
+        let alloc_len = ((cdb[6] as usize) << 16) | ((cdb[7] as usize) << 8) | (cdb[8] as usize);
+
+        match mode {
+            0x00 => {
+                // Combined header and data mode
+                // Return 4-byte header followed by buffer data
+                let mut data = Vec::new();
+                // Header: reserved byte, then 24-bit buffer capacity
+                data.push(0x00);  // Reserved
+                data.push(((SCSI_BUFFER_SIZE >> 16) & 0xFF) as u8);
+                data.push(((SCSI_BUFFER_SIZE >> 8) & 0xFF) as u8);
+                data.push((SCSI_BUFFER_SIZE & 0xFF) as u8);
+
+                // Append buffer data
+                let data_len = alloc_len.saturating_sub(4).min(SCSI_BUFFER_SIZE - offset);
+                if offset < SCSI_BUFFER_SIZE && data_len > 0 {
+                    data.extend_from_slice(&self.buffer[offset..offset + data_len]);
+                }
+
+                // Truncate to allocation length
+                data.truncate(alloc_len);
+
+                Ok(ScsiResponse {
+                    status: 0x00,
+                    data,
+                })
+            }
+            0x01 | 0x02 => {
+                // Mode 0x01: Vendor specific (treat as data mode)
+                // Mode 0x02: Data mode - return buffer data without header
+                if offset + alloc_len > SCSI_BUFFER_SIZE {
+                    return Ok(ScsiResponse {
+                        status: 0x02,  // Check condition
+                        data: vec![],
+                    });
+                }
+
+                let data = self.buffer[offset..offset + alloc_len].to_vec();
+
+                Ok(ScsiResponse {
+                    status: 0x00,
+                    data,
+                })
+            }
+            0x03 => {
+                // Descriptor mode - return 4-byte buffer descriptor
+                // Byte 0: Offset boundary (0 = no specific boundary)
+                // Bytes 1-3: Buffer capacity (24-bit, big-endian)
+                let data = vec![
+                    0x00,  // Offset boundary
+                    ((SCSI_BUFFER_SIZE >> 16) & 0xFF) as u8,
+                    ((SCSI_BUFFER_SIZE >> 8) & 0xFF) as u8,
+                    (SCSI_BUFFER_SIZE & 0xFF) as u8,
+                ];
+
+                Ok(ScsiResponse {
+                    status: 0x00,
+                    data,
+                })
+            }
+            _ => {
+                // Unsupported mode - return check condition
+                Ok(ScsiResponse {
+                    status: 0x02,
+                    data: vec![],
+                })
+            }
+        }
+    }
+
+    fn exec_send_diagnostic(&self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        // SEND DIAGNOSTIC - just return success
+        Ok(ScsiResponse {
+            status: 0x00,
+            data: vec![],
+        })
+    }
+
+    fn exec_read_toc_pma_atip(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if self.backend.is_none() {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
+        let msf    = (cdb[1] & 0x02) != 0;
+        let format = cdb[2] & 0x0F;
+
+        // TOC LBAs are always in physical CD sectors (2048 bytes each).
+        let total_lba = (self.size / self.phys_block_size) as u32;
+        //eprintln!("SCSI READ TOC: format={} msf={} total_lba={} (current block_size={})",
+        //    format, msf, total_lba, self.logical_block_size);
+
+        match format {
+            0 => {
+                // Standard TOC: track 1 (data) + lead-out (0xAA)
+                // Response header (4 bytes) + 2 track descriptors × 8 bytes = 20 bytes total
+                let mut data = Vec::with_capacity(20);
+                data.push(0x00); data.push(0x12); // TOC Data Length = 18 (follows this field)
+                data.push(0x01); // First track number
+                data.push(0x01); // Last track number
+
+                // Track 1: data track
+                data.push(0x00); // Reserved
+                data.push(0x14); // ADR=1, CTRL=4 (data, no copy)
+                data.push(0x01); // Track 1
+                data.push(0x00); // Reserved
+                if msf {
+                    data.extend_from_slice(&[0x00, 0x00, 0x02, 0x00]); // MSF 0:02:00 (2-sec pregap)
+                } else {
+                    data.extend_from_slice(&0u32.to_be_bytes()); // LBA 0
+                }
+
+                // Lead-out track
+                data.push(0x00); // Reserved
+                data.push(0x14); // ADR=1, CTRL=4
+                data.push(0xAA); // Lead-out
+                data.push(0x00); // Reserved
+                if msf {
+                    let f = (total_lba % 75) as u8;
+                    let s = ((total_lba / 75) % 60) as u8;
+                    let m = (total_lba / 75 / 60) as u8;
+                    data.push(0x00); data.push(m); data.push(s); data.push(f);
+                } else {
+                    data.extend_from_slice(&total_lba.to_be_bytes());
+                }
+
+                Ok(ScsiResponse { status: 0x00, data })
+            }
+            1 => {
+                // Session info: one complete session
+                let mut data = vec![0u8; 12];
+                data[0] = 0x00; data[1] = 0x0A; // Length = 10 (follows this field)
+                data[2] = 0x01; // First complete session
+                data[3] = 0x01; // Last complete session
+                // First track in last session
+                data[4] = 0x00;
+                data[5] = 0x14; // ADR=1, CTRL=4
+                data[6] = 0x01; // Track 1
+                data[7] = 0x00;
+                data[8..12].copy_from_slice(&0u32.to_be_bytes()); // LBA 0
+                Ok(ScsiResponse { status: 0x00, data })
+            }
+            _ => Ok(self.check_condition(0x05, 0x24, 0x00)), // Invalid Field in CDB
+        }
+    }
+
+    /// SGI vendor command 0xC4 — eject / next disc.
+    /// On real hardware this spins the tray out. eject_next() handles the
+    /// count-driven cases: 0/1 disc empties the tray; 2+ discs cycle to the
+    /// next and raise Unit Attention so IRIX re-reads the TOC.
+    fn exec_sgi_eject(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if !self.is_cdrom() {
+            return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid command for HDD
+        }
+        self.eject_next();
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// SGI vendor command 0xC9 — HD-to-CD-ROM mode switch.
+    /// On real SGI drives this switches the INQUIRY response from HDD to CD-ROM
+    /// (drives power on as HDD to support older SGI systems that can't boot from CD).
+    /// Block size is NOT changed — that is controlled by MODE SELECT only.
+    fn exec_sgi_hd2cdrom(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        //eprintln!("SCSI SGI_HD2CDROM: no-op");
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    fn exec_get_configuration(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        if !self.is_cdrom() {
+            return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid Command
+        }
+        // Minimal response: header + Feature 0x0000 (Profile List) with CD-ROM profile
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Data Length placeholder
+        data.extend_from_slice(&[0x00, 0x00]);              // Reserved
+        data.extend_from_slice(&[0x00, 0x08]);              // Current Profile: CD-ROM (0x0008)
+        // Feature 0x0000 — Profile List
+        data.extend_from_slice(&[0x00, 0x00]); // Feature Code
+        data.push(0x03);                        // Version=0, Persistent=1, Current=1
+        data.push(0x04);                        // Additional Length = 4 (one descriptor)
+        data.extend_from_slice(&[0x00, 0x08]); // Profile: CD-ROM
+        data.push(0x01);                        // CurrentP = 1
+        data.push(0x00);                        // Reserved
+        // Fill in Data Length (total - 4 header bytes)
+        let dlen = (data.len() as u32) - 4;
+        data[0..4].copy_from_slice(&dlen.to_be_bytes());
+        Ok(ScsiResponse { status: 0x00, data })
+    }
+}

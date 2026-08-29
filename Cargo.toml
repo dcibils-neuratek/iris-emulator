@@ -1,0 +1,366 @@
+[workspace]
+members = ["iris-gui"]
+
+[package]
+name = "iris"
+version = "0.1.0"
+edition = "2021"
+default-run = "iris"
+
+[features]
+# Uncomment to enable cache debug tracking (tracks specific cache line across all operations)
+debug_cache = []
+developer = []
+developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
+developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TLB errors
+# Synthetic deterministic clock for CP0 Compare calibration: dt_ns derived from
+# (instructions executed) * 10ns instead of host Instant::now(). Required for
+# the snapshot determinism validator (Phase 3.3). Default OFF preserves the
+# wallclock-anchored timer that interactive desktop builds expect.
+ci_clock = []
+# MIPS opcode fusion: branch/jump+NOP delay slot, LUI+ORI/ADDIU (32-bit
+# immediate materialization), and ADDU/SUBU/ADDIU+load/store (address-calc
+# then dereference) each collapse into a single decode/dispatch. Real perf
+# win (whetstone 85.1 -> 95.2 MIPS across the three stages), but a fused
+# pair's second instruction is never independently fetched/decoded/dispatched
+# — so a PC/VirtFetch/PhysFetch breakpoint set on that instruction's address
+# silently never fires. Incompatible with reliable interactive debugging;
+# implied by `lightning` (same "give up debuggability for speed" tradeoff).
+opcodefusion = []
+# Lightning: pedal-to-the-metal build — disables breakpoint checks and traceback buffer updates.
+# Incompatible with interactive debugging. For end-user / benchmarking builds only.
+lightning = ["opcodefusion"]
+# O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces linear scan
+# for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
+# downstream tooling that passes --features tlbvmap still compiles cleanly.
+tlbvmap = []
+# TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
+# MRU scan paths including entries-walked totals.  Print at emulator exit.
+tlbstats = []
+# jitstats: instrumentation for the JIT inline load/store path
+# (docs/nutlb-design.md, docs/jit-inline-memory.md). Counts, per load/store,
+# how far an access gets through the checks compiled code would emit —
+# nutlb hit -> L1D tag match -> (dirty, for stores) -> (transparent region,
+# under tcache) — and reports the joint rate at exit.
+#
+# The point is tuning, not go/no-go: inline memory access is a prerequisite
+# for TCG/DRC-class performance, and nutlb + tcache exist to enable it. These
+# counters say which cases are worth emitting and where the fallbacks land.
+# Diagnostic only; adds a probe to every cached access.
+jitstats = []
+# nutlb: 256-entry direct-mapped data-side micro-TLB replacing the nanotlb's
+# Read/Write slots (docs/nutlb-design.md). Entries are self-describing —
+# ASID + permission set + TLB generation in the tag — so mode switches,
+# exceptions and ERET no longer have to flush the data side; only a real TLB
+# mutation (via the generation counter) retires them. The Fetch slot keeps
+# the old untagged, barrier-flushed nanotlb entry either way.
+#
+# OFF by default while it earns its keep: the incumbent is a 1-entry structure
+# that a previous 4-way experiment LOST to, so this has to be measured, not
+# assumed. Build both ways and compare with `iris-bench matrix` (+ tlbstats
+# for hit/miss/conflict breakdown).
+nutlb = []
+# TLB consistency checker: after every TLBWI/TLBWR, walk the whole JTLB and
+# verify there are no duplicate/overlapping entries, that the shadow array
+# matches the architectural entries, that each MRU list visits every valid
+# entry exactly once, and (with tlbvmap) that vmap agrees with a full scan.
+# Diagnostic only — O(entries^2) per write, far too slow for normal use.
+# Exists because bogus "duplicate TLB entry" IRIX panics turned out to be
+# emulator TLB-management bugs; this catches them at the moment they occur
+# instead of many instructions later at a confusing kernel panic.
+tlbcheck = []
+# Per-instruction decode and execution frequency counters (all ~205 MIPS
+# III/IV opcodes), printed at emulator exit with a MIPS III/IV usage rollup,
+# plus diffable instr_used.txt/instr_counts.txt dumps. Diagnostic only —
+# classifies every decoded/executed instruction via a match mirroring
+# decode_into, so it is intrusive on the hot path. Kept out of default
+# builds. Note: execution counts are interpreter-path only — instructions
+# running as compiled jitv2 code bypass this counter entirely (see
+# InstrStats's doc comment in mips_instr_stats.rs). The classifier itself
+# (InstrKind/classify_instr) always compiles, independent of this flag —
+# jitv2::opcode_support depends on it unconditionally for its own
+# emitter-coverage gating. See mips_instr_stats.rs.
+instr_stats = []
+# MIPS IV ISA additions (MOVN/MOVZ, PREF, RECIP/RSQRT, MOVF/MOVT, COP1X,
+# MADD/MSUB/NMADD/NMSUB): decode gate only, independent of cache/PRId model.
+# Off by default so an R4400 (MIPS III) build correctly raises Reserved
+# Instruction on these encodings instead of executing them. Implied by r5k,
+# since every R5000-family CPU IRIS emulates is MIPS IV.
+mips4 = []
+# R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
+# Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
+r5k = ["mips4"]
+# Secondary cache present. Without this flag the CPU reports SC=1 (no secondary cache)
+# and the L2 is bypassed entirely. Use alone for external R4600SC-style cache sized via
+# EEPROM, or together with r5ksc_triton for Triton on-die L2.
+r5ksc = []
+# Triton integrated L2: on-die 1MB/32B cache reported via CONFIG.SC=0, controlled via
+# CONFIG.SE (bit 12 enable/disable), and sized via CONFIG.SS (bits 23:22).
+# Implies r5ksc (Triton always has secondary cache present).
+r5ksc_triton = ["r5ksc"]
+# Idle detection + in-place CPU park: when the guest sits in its interrupt-enabled
+# idle loop, sleep the CPU thread until the next timer tick / device interrupt
+# rather than spinning the host core (see docs/idle-pause-work.md). Wallclock-
+# anchored timing; the IRIS_NO_IDLE env var disables it at runtime when compiled
+# in. OFF by default (the CPU thread spins) — opt in with --features idle-pause;
+# off keeps deterministic-clock and raw-benchmark builds simple.
+idle-pause = []
+# Host-MMU-backed physical paged memory (docs/ppmem-design.md). Replaces the
+# Vec<u32>-plus-addr_mask RAM banks in src/mem.rs with real host mappings, so
+# SIMM mirroring and the low-512KB alias are expressed as repeated mappings
+# instead of masking on every access. Experimental; `Memory` remains the
+# default and the fallback.
+ppmem = []
+# Transparent cache (docs/tcache-design.md): keep the whole cache tag/state
+# machine — line states, LRU, dirty bits, VCE, CACHE-instruction semantics —
+# but stop storing line *data* for cacheable RAM. Reads and writes go straight
+# through ppmem's window, so fills copy nothing and evictions write nothing
+# back. Decoded-instruction slots (L1I on R5000, L2 on R4400) are the deliberate
+# exception and are still filled — they cache work, not memory.
+# Requires ppmem for the window pointer + mapped-region bitmap. Experimental.
+tcache = ["ppmem"]
+# tcache self-check: after every cacheable access, assert that ppmem's window is
+# authoritative for transparent addresses — no BACKED L1D line over a
+# transparent address, and no DIRTY L2 line whose data disagrees with RAM.
+# Panics at the exact diverging access instead of letting corruption surface as
+# a guest crash much later. Very slow; diagnostic only.
+tcache_verify = ["tcache"]
+default = ["tlbvmap"]
+# Cranelift-based JIT compiler for REX3 graphics draw shaders.
+rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
+# JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
+# Unconditionally-correct-at-publish redesign, replacing the speculative v1
+# tiered JIT. Built incrementally behind this flag; does not imply `jit`.
+jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
+# jitv2 opcode fusion: LUI+ORI/ADDIU (32-bit immediate materialization) and
+# branch/jump+NOP delay-slot collapsing, jitv2's counterparts to the
+# interpreter's `opcodefusion` feature. OFF by default (unlike the
+# interpreter's own fusion) — the LUI+ORI/ADDIU fuse in particular shipped
+# with a live bug (silently corrupting a register and dropping a pending
+# foreign delay-slot transfer whenever the standalone-compiled LUI word was
+# actually running as someone else's delay slot at runtime; see
+# rules/jit/jitv2_lui_fusion_foreign_delay_slot_hazard.md) that was hit on
+# real IRIX boot/shutdown traces even after a first fix landed. Not worth the
+# debuggability/complexity cost for the perf it buys in the jitv2 pipeline
+# specifically; opt in with --features jitv2_opcodefusion once it's earned
+# more confidence.
+jitv2_opcodefusion = ["jitv2"]
+# jitv2 whole-page compile (§13, rules/jitv2/jit-v2-design.md): one compiled
+# Cranelift function per 4KB physical page with multiple dispatchable entry
+# points, replacing the default one-function-per-entry-point design. Shares
+# the pool/MRU/free-list, analyzer walk primitives, and Cranelift codegen
+# with the default path; forks PhysicalCodePage's layout, page_for, the
+# compile-thread request handlers (comp.rs), and the mips_exec.rs dispatch
+# gate's FR-mode plumbing. Not yet production-ready as of introduction (real
+# boots have hit a core dump) — opt in for testing, default path (this flag
+# off) is what ships. See that doc's §13 for the full design rationale.
+j2wp = ["jitv2"]
+# jitv2 dev tool: dump every compile-request's 4KB page snapshot to
+# jitv2_corpus/ instead of (alongside) actually compiling. Used to build a
+# corpus for offline analyzer/codegen development; off by default so normal
+# jitv2 runs never touch the filesystem from the compile thread.
+jitv2_corpus_dump = ["jitv2"]
+# jitv2 dev tool: temporary in-process lockstep verifier. On every dispatch,
+# classifies the current instruction (alu/branch/load-store/fpu) and, for the
+# categories currently wired up (alu only, to start), inline-compiles just
+# that one instruction, runs it against a saved core snapshot, restores real
+# core state, then runs the interpreter and asserts the two agree — a much
+# faster way to bisect a live-boot divergence into single instructions than
+# chopping the whole boot into recompiled binaries each time. Not for normal
+# runs (pays a compile per matching instruction, none of it cached).
+#
+# Pulls in `developer`: lockstep's divergence reports are only actionable with
+# the monitor/traceback machinery (`dt`, `r`, `d pc`) that developer provides,
+# and its own EXEC_BREAKPOINT-on-divergence path breaks into that monitor.
+# Also forces the inline load/store fast path off at runtime
+# (`codegen::inline_mem_enabled`) — it bypasses the callout wrappers lockstep
+# verifies memory through. `lightning`/`opcodefusion` are refused outright in
+# src/lib.rs: Cargo features are additive, so an incompatible one can only be
+# rejected, never unset.
+jitv2_lockstep = ["jitv2", "developer"]
+# Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
+# Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
+# CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.
+# Off by default — enable with `cargo build --features chd`.
+chd = ["dep:libchdman-rs"]
+# Live host camera capture as the VINO video source (phase 3 of IndyCam
+# emulation).  Platform backends:
+#   macOS   — nokhwa AVFoundation (dep:nokhwa)
+#   Linux   — v4l crate directly (dep:v4l); requires libv4l-dev at build time
+#   Windows — nokhwa MediaFoundation (dep:nokhwa)
+# Off by default — enable with `cargo build --features camera`.
+camera = ["dep:nokhwa", "dep:v4l"]
+# PCAP/bridged networking backend: instead of the built-in software NAT gateway,
+# bridge the guest's raw Ethernet frames onto a real host interface via libpcap.
+# Lets the guest appear as a real L2 host on the physical LAN. Requires a pcap
+# library at build+run time and elevated privileges (root / CAP_NET_RAW /
+# Administrator) to capture and inject.
+#   Linux/macOS : libpcap (headers+lib).
+#   Windows     : the `pcap` crate links the generic `wpcap` import library, so
+#                 it works with the BSD-licensed WinPcap Developer Pack as well
+#                 as Npcap. IRIS links dynamically and never bundles the driver,
+#                 so the runtime driver's license does not attach to IRIS.
+# Off by default — enable with `cargo build --features pcap`. Select at runtime
+# with `[network] mode = "pcap"` in iris.toml.
+pcap = ["dep:pcap"]
+# N64 development board (Ultra64) — GIO slot 0 + shm IPC.
+ultra64 = ["dep:shared_memory", "dep:raw_sync"]
+# DaynaPort SCSI/Link target: a SCSI-attached Ethernet adapter (type 3
+# Processor device) selectable per SCSI id, giving the guest a second network
+# path that does not go through the onboard SEEQ. Needs a guest driver — see
+# github.com/techomancer/irixdayna for the IRIX one. Each target runs its own
+# NAT gateway (or PCAP bridge with --features pcap) on its own subnet.
+# Off by default — enable with `cargo build --features daynaport`, then select
+# it at runtime with `kind = "daynaport"` in an `[scsi.N]` section.
+daynaport = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+winit = "0.30"
+glutin = "0.32"
+glutin-winit = "0.5"
+glow = "0.17"
+raw-window-handle = "0.6"
+rtrb = "0.4"
+socket2 = { version = "0.6", features = ["all"] }
+crossbeam-utils = "0.8"
+crossbeam-queue = "0.3"
+bitfield = "0.19"
+cpal = "0.18"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.0.3"
+postcard = { version = "1", features = ["alloc"] }
+blake3 = "1"
+png = "0.18"
+parking_lot = "0.12"
+spin = "0.9"
+# rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
+# pulls its own `pollster` executor to block on the portal's async D-Bus calls.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+gdbstub = { version = "0.7", features = ["std"] }
+gdbstub_arch = "0.3"
+cranelift-codegen    = { version = "0.134", optional = true }
+cranelift-frontend   = { version = "0.134", optional = true }
+cranelift-jit        = { version = "0.134", optional = true }
+cranelift-module     = { version = "0.134", optional = true }
+cranelift-native     = { version = "0.134", optional = true }
+target-lexicon       = { version = "0.13",  optional = true }
+region               = { version = "3.0",   optional = true }
+wasmtime-jit-icache-coherence = { version = "=47.0.3", optional = true, package = "wasmtime-internal-jit-icache-coherence" }
+libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
+pcap = { version = "2", optional = true }
+shared_memory = { version = "0.12", optional = true }
+raw_sync      = { version = "0.1",  optional = true }
+# ppmem's Windows backend (src/ppmem/map_windows.rs) additionally needs
+# Win32_System_Memory (VirtualAlloc2/MapViewOfFile3/UnmapViewOfFile2 placeholder
+# API), Win32_System_SystemInformation (GetSystemInfo, for the 64KB allocation
+# granularity) and Win32_Security — the last is non-obvious: CreateFileMappingW
+# is gated behind it because its second parameter is a SECURITY_ATTRIBUTES
+# pointer, so without it the import fails to resolve.
+# thread_affinity.rs calls SetThreadAffinityMask/GetCurrentThread, whose
+# signatures name Foundation::HANDLE — so Win32_Foundation is required on top of
+# Win32_System_Threading. It used to arrive by feature unification from rfd /
+# socket2 / anstyle-wincon; declare it so the Windows build doesn't depend on
+# who else happens to be in the graph.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_Security"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", optional = true }
+v4l    = { version = "0.14", features = ["v4l2-sys"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+# Developer profile: release optimizations + debug symbols. Default build target.
+# Enables the "developer" feature flag for dev-only tooling.
+# Usage: cargo build  (or explicitly: cargo build --profile developer)
+[profile.developer]
+inherits = "release"
+debug = true
+lto = "fat"
+codegen-units = 1
+
+
+# Profiling profile: release optimizations + full debug info for flamegraph/perf.
+# Usage: cargo build --profile profiling && perf record ./target/profiling/iris
+#        cargo flamegraph --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
+
+[[bin]]
+name = "iris"
+path = "src/main.rs"
+
+[[bin]]
+name = "coffdump"
+path = "src/coffdump.rs"
+
+[[bin]]
+name = "iris-ci"
+path = "src/iris_ci_main.rs"
+
+# Benchmark driver. Named with a hyphen to match `iris-ci`, so the path has to
+# be spelled out — cargo's own bin autodiscovery would call it `iris_bench`.
+[[bin]]
+name = "iris-bench"
+path = "src/bin/iris_bench.rs"
+
+[[bin]]
+name = "chd_extract"
+path = "src/bin/chd_extract.rs"
+required-features = ["chd"]
+
+[[bin]]
+name = "mkvh"
+path = "src/bin/mkvh.rs"
+
+[[bin]]
+name = "jitv2_analyze"
+path = "src/bin/jitv2_analyze.rs"
+required-features = ["jitv2"]
+
+[[bin]]
+name = "jitv2_verify"
+path = "src/bin/jitv2_verify.rs"
+required-features = ["jitv2"]
+
+[[bin]]
+name = "jitv2_pcp_dump"
+path = "src/bin/jitv2_pcp_dump.rs"
+required-features = ["jitv2", "j2wp"]
+
+# Mac App Store fix (guideline 2.5.1): eframe's winit (0.30) calls the private
+# SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary
+# scan rejects. Our vendored copy stubs WindowDelegate::set_blur to a no-op and
+# drops the private extern declarations; iris-gui never requests window blur,
+# so behaviour is unchanged. Only the 0.30.x requirement (eframe → egui-winit →
+# glutin-winit) matches this patch; iris's own winit 0.29 dependency is the
+# keyboard-KeyCode type only and creates no window in iris-gui, so its blur code
+# is dead-stripped. See rules/macos/appstore-private-api.md.
+[patch.crates-io]
+winit = { path = "third_party/winit-0.30.13" }
+# block 0.1.6 is that crate's final release (2016) and declares a static of an
+# uninhabited type, a future hard error (rust#74840). Reached only on macOS, via
+# nokhwa -> cocoa/metal. The vendored copy makes `Class` opaque-but-inhabited, as
+# its maintained successor block2 does. Drop when nokhwa stops pulling `block`.
+block = { path = "third_party/block-0.1.6" }
+
+
+

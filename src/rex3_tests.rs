@@ -1,0 +1,4110 @@
+// REX3 unit tests — ported from SGI NEWPORT IDE diagnostics (rex3.c, vram3.c, minigl3.c)
+//
+// Strategy: construct Rex3 via Arc, call start() to launch the real GFIFO processor thread.
+// Write registers via write32() through the BusDevice path (real GFIFO queue).
+// Read registers via read32(); HOSTRW reads block until the draw thread produces a pixel.
+// Inspect framebuffers directly via unsafe { &*rex3.fb_rgb.get() }.
+//
+// Coordinate encoding: XYSTARTI packs (x+COORD_BIAS)<<16 | (y+COORD_BIAS) as u16s.
+// Framebuffer index: fb_rgb[y * 2048 + x] for screen coordinate (x, y).
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use crate::traits::{BusRead32, BusRead64};
+use super::*;
+
+// ---------------------------------------------------------------------------
+// Test harness helpers
+// ---------------------------------------------------------------------------
+
+/// Build a running Rex3 with the GFIFO processor thread started.
+/// Uses Box::leak to get a 'static reference — memory is reclaimed by the OS after the test
+/// process exits. The processor thread also holds a 'static ref via start()'s transmute.
+/// Construction runs on a thread with an 8MB stack because Rex3 is large enough to overflow
+/// the default Rust test thread stack (2MB).
+fn make_rex3() -> &'static Rex3 {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let rex = Box::leak(Box::new(Rex3::new(
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            )));
+            unsafe {
+                (*rex.fb_rgb.get()).fill(0);
+                (*rex.fb_aux.get()).fill(0);
+            }
+            rex.start();
+            rex
+        })
+        .expect("spawn")
+        .join()
+        .expect("make_rex3 thread panicked")
+}
+
+// Compute the SET address (no GO bit) for a register offset.
+fn set_addr(offset: u32) -> u32 { REX3_BASE | offset }
+// Compute the GO address (bit 11 set) for a register offset.
+fn go_addr(offset: u32) -> u32  { REX3_BASE | 0x0800 | offset }
+
+/// Write a register to the SET space (no draw trigger).
+fn reg(rex: &Rex3, offset: u32, value: u32) {
+    rex.write32(set_addr(offset), value);
+}
+
+/// Write a register to the GO space (triggers a draw), then wait for idle.
+/// Equivalent to writing to go.reg + REX3WAIT(REX) in SGI diagnostics.
+fn reg_go(rex: &Rex3, offset: u32, value: u32) {
+    rex.write32(go_addr(offset), value);
+    rex.wait_idle();
+}
+
+/// Wait for the GFIFO processor to drain (equivalent to REX3WAIT).
+fn wait(rex: &Rex3) {
+    rex.wait_idle();
+}
+
+/// Read a 32-bit context register.  Blocks until the GFIFO is idle first.
+fn read_reg(rex: &Rex3, offset: u32) -> u32 {
+    rex.wait_idle();
+    let r: BusRead32 = rex.read32(set_addr(offset));
+    if r.is_ok() { r.data } else { panic!("read_reg: bad status for offset {offset:#x}") }
+}
+
+/// Read from HOSTRW0 GO space: returns current word, then triggers next batch.
+/// Use for all reads except the final one in a sequence.
+fn read_hostrw32(rex: &Rex3) -> u32 {
+    loop {
+        let r: BusRead32 = rex.read32(go_addr(REX3_HOSTRW0));
+        if r.is_ok() { return r.data; }
+        std::hint::spin_loop();
+    }
+}
+
+/// Read from HOSTRW0 SET space: returns current word, does NOT trigger next batch.
+/// Use for the final read in a HOSTR sequence.
+fn read_hostrw32_last(rex: &Rex3) -> u32 {
+    loop {
+        let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW0));
+        if r.is_ok() { return r.data; }
+        std::hint::spin_loop();
+    }
+}
+
+/// Read from HOSTRW0 GO space (64-bit): returns current word, triggers next batch.
+fn read_hostrw64(rex: &Rex3) -> u64 {
+    loop {
+        let r: BusRead64 = rex.read64(go_addr(REX3_HOSTRW0));
+        if r.is_ok() { return r.data; }
+        std::hint::spin_loop();
+    }
+}
+
+/// Read from HOSTRW0 SET space (64-bit): returns current word, no next-batch trigger.
+fn read_hostrw64_last(rex: &Rex3) -> u64 {
+    loop {
+        let r: BusRead64 = rex.read64(set_addr(REX3_HOSTRW0));
+        if r.is_ok() { return r.data; }
+        std::hint::spin_loop();
+    }
+}
+
+/// Write a 32-bit word to HOSTRW0 (CPU→REX draw path).
+fn write_hostrw32(rex: &Rex3, val: u32) {
+    rex.write32(go_addr(REX3_HOSTRW0), val);
+}
+
+/// Write a 64-bit double to HOSTRW0 (CPU→REX draw path, 64-bit GIO bus).
+fn write_hostrw64(rex: &Rex3, val: u64) {
+    rex.write64(go_addr(REX3_HOSTRW0), val);
+}
+
+/// Read fb_rgb pixel at screen (x, y) — direct framebuffer access for verification.
+fn read_pixel(rex: &Rex3, x: i32, y: i32) -> u32 {
+    unsafe { (*rex.fb_rgb.get())[(y as u32 * 2048 + x as u32) as usize] }
+}
+
+/// Encode (x, y) for XYSTARTI/XYENDI: add COORD_BIAS, pack as (x<<16 | y).
+fn xy(x: i32, y: i32) -> u32 {
+    let xi = (x + REX3_COORD_BIAS) as u16 as u32;
+    let yi = (y + REX3_COORD_BIAS) as u16 as u32;
+    (xi << 16) | yi
+}
+
+// ---------------------------------------------------------------------------
+// Fractional (sub-pixel) coordinate helpers for F_LINE/A_LINE.
+//
+// Use the plain XSTART/YSTART/XEND/YEND registers (16.4(7) format, written
+// via from16_4_7 which sign-extends through Rex3RegisterOps::rexset — see
+// rex3.rs) rather than the GL-fast-path XSTARTF/YSTARTF/XENDF/YENDF
+// aliases. Per the REX3 spec (rex3_pdf.md table 7): "XSTARTF ... GL version
+// of XSTART, (zeros 4 msbs)" — XSTARTF is a *narrower* register that zeros
+// the top bits and cannot represent REX3_COORD_BIAS-shifted (4096-biased)
+// screen coordinates at all (confirmed experimentally: writing a biased
+// value through XSTARTF truncates the bias away, then calculate_fb_address
+// subtracts COORD_BIAS *again* on top of the now-unbiased value, sending
+// every pixel address far out of bounds — nothing gets drawn). Plain
+// XSTART/YSTART/XEND/YEND round-trip biased values correctly (confirmed:
+// from16_4_7(biased_val) recovers the exact screen coordinate on readback),
+// matching how XYSTARTI/XYENDI already bias internally in xy().
+//
+// `frac4` is a 0-15 nibble in 1/16-pixel units — the only fractional
+// precision the interpreter's fline_apply_fract/draw_aline ever consult
+// (bits [10:7] of the 21.11 value). `screen_x`/`screen_y` are plain screen
+// pixel coordinates (same convention as xy()'s x/y params); REX3_COORD_BIAS
+// is added internally so these stay bias-consistent with any other
+// XYSTARTI/XYENDI-driven endpoint on the same line.
+// ---------------------------------------------------------------------------
+
+fn write_xstartf(rex: &Rex3, screen_x: i32, frac4: i32) {
+    let biased = screen_x + REX3_COORD_BIAS;
+    reg(rex, REX3_XSTART, ((biased << 11) | (frac4 << 7)) as u32);
+}
+fn write_ystartf(rex: &Rex3, screen_y: i32, frac4: i32) {
+    let biased = screen_y + REX3_COORD_BIAS;
+    reg(rex, REX3_YSTART, ((biased << 11) | (frac4 << 7)) as u32);
+}
+fn write_xendf(rex: &Rex3, screen_x: i32, frac4: i32) {
+    let biased = screen_x + REX3_COORD_BIAS;
+    reg(rex, REX3_XEND, ((biased << 11) | (frac4 << 7)) as u32);
+}
+fn write_yendf(rex: &Rex3, screen_y: i32, frac4: i32) {
+    let biased = screen_y + REX3_COORD_BIAS;
+    reg(rex, REX3_YEND, ((biased << 11) | (frac4 << 7)) as u32);
+}
+
+// ============================================================================
+// DRAWMODE constants (matching minigl3.c / SGI headers)
+// ============================================================================
+
+// DRAWMODE1 combinations. COMPARE is included at its disabled value (0x7) — real
+// drawmode1 words always carry it explicitly; omitting it would leave COMPARE=0
+// (afunction always-kill) since DrawMode1's bitfield default zero-inits.
+const DM1_CI8_SRC: u32   = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+const DM1_RGB24_SRC: u32 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+
+// DRAWMODE1 host-depth fields (bits [4:3] = hostdepth, bit 16 = rwpacked, bit 17 = rwdouble)
+// hostdepth: 0=4bpp, 1=8bpp, 2=12bpp, 3=32bpp
+const DM1_HOSTDEPTH8:  u32 = 1 << 3;   // hostdepth=1 → 8bpp packed
+const DM1_HOSTDEPTH32: u32 = 3 << 3;   // hostdepth=3 → 32bpp
+const DM1_RWPACKED:    u32 = 1 << 16;  // pack multiple pixels per word
+const DM1_RWDOUBLE:    u32 = 1 << 17;  // 64-bit GIO bus transfers
+
+// DRAWMODE0 base combinations (stoponx=bit8, stopony=bit9)
+const DM0_STOPONX:    u32 = 1 << 8;
+const DM0_STOPONY:    u32 = 1 << 9;
+const DM0_STOPONXY:   u32 = DM0_STOPONX | DM0_STOPONY;
+const DM0_DOSETUP:    u32 = 1 << 5;
+const DM0_COLORHOST:  u32 = 1 << 6;  // pixel data comes from / goes to host FIFO (bit 6)
+
+const DM0_DRAW_BLOCK:  u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+const DM0_DRAW_SPAN:   u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN  | DM0_STOPONX;
+const DM0_SCR2SCR:     u32 = DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK | DM0_DOSETUP | DM0_STOPONXY;
+// DRAW with COLORHOST: pixels come from host write FIFO
+const DM0_HOSTW_BLOCK: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY | DM0_COLORHOST;
+// READ with COLORHOST: reads fb → host read FIFO
+const DM0_READ_BLOCK:  u32 = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY | DM0_COLORHOST | DM0_DOSETUP;
+
+/// Initialise REX3 to a known baseline — matches rex3init() from rex3.c.
+/// XYWIN is left at 0 (no hardware xbias correction needed in emulation).
+/// clipmode=0 means no smask checking, no CID checking.
+fn rex3init(rex: &Rex3) {
+    reg(rex, REX3_LSMODE,      0);
+    reg(rex, REX3_LSPATTERN,   0);
+    reg(rex, REX3_LSPATSAVE,   0);
+    reg(rex, REX3_ZPATTERN,    0);
+    reg(rex, REX3_COLORBACK,   0xDEADBEEF);
+    reg(rex, REX3_COLORVRAM,   0xFFFFFF);
+    reg(rex, REX3_SMASK0X,     0);
+    reg(rex, REX3_SMASK0Y,     0);
+    reg(rex, REX3_XSAVE,       0);
+    reg(rex, REX3_XYMOVE,      0);
+    reg(rex, REX3_BRESD,       0);
+    reg(rex, REX3_BRESS1,      0);
+    reg(rex, REX3_BRESOCTINC1, 0);
+    reg(rex, REX3_BRESRNDINC2, 0);
+    reg(rex, REX3_BRESE1,      0);
+    reg(rex, REX3_BRESS2,      0);
+    reg(rex, REX3_AWEIGHT0,    0);
+    reg(rex, REX3_AWEIGHT1,    0);
+    reg(rex, REX3_COLORRED,    0);
+    reg(rex, REX3_COLORALPHA,  0);
+    reg(rex, REX3_WRMASK,      0xFFFFFF);
+    reg(rex, REX3_SMASK1X,     0);
+    reg(rex, REX3_SMASK1Y,     0);
+    reg(rex, REX3_SMASK2X,     0);
+    reg(rex, REX3_SMASK2Y,     0);
+    reg(rex, REX3_SMASK3X,     0);
+    reg(rex, REX3_SMASK3Y,     0);
+    reg(rex, REX3_SMASK4X,     0);
+    reg(rex, REX3_SMASK4Y,     0);
+    reg(rex, REX3_XYWIN,       0);
+    reg(rex, REX3_TOPSCAN,     0x3FF);
+    reg(rex, REX3_CLIPMODE,    0);  // no CID, no smask checking
+    wait(rex);
+}
+
+// ============================================================================
+// Tests ported from SGI rex3.c: test_rex3() — register read/write
+// ============================================================================
+
+/// Port of SGI test_rex3(): write walking patterns to every context register,
+/// read back and verify the expected masked value.
+/// Covers: lsmode, lspattern, lspatsave, zpattern, colorback, colorvram, alpharef,
+///         smask0x/y, xsave, xymove, bresd, bress1, bresoctinc1, bresrndinc2,
+///         brese1, bress2, aweight0/1, colorred, coloralpha, colorgrn, colorblue,
+///         wrmask, smask1-4 x/y, topscan, xywin, clipmode, xstarti→xstart readback.
+#[test]
+fn test_rex3_register_rw() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Walking patterns: 0x00000000, 0x55555555, 0xAAAAAAAA, 0xFFFFFFFF
+    // (SGI uses i*0x55555555 for i in 0..=3)
+    for &pattern in &[0x00000000u32, 0x55555555, 0xAAAAAAAA, 0xFFFFFFFF] {
+
+        // Helper: write, read back, check (data & mask) == got
+        let check = |offset: u32, mask: u32| {
+            reg(&rex, offset, pattern);
+            let got = read_reg(&rex, offset);
+            let expect = pattern & mask;
+            assert_eq!(got, expect,
+                "reg {offset:#06x} pattern={pattern:#010x}: got {got:#010x} expected {expect:#010x}");
+        };
+
+        check(REX3_LSMODE,      0x0FFFFFFF); // 28-bit
+        check(REX3_LSPATTERN,   0xFFFFFFFF);
+        check(REX3_LSPATSAVE,   0xFFFFFFFF);
+        check(REX3_ZPATTERN,    0xFFFFFFFF);
+        check(REX3_COLORBACK,   0xFFFFFFFF);
+        check(REX3_COLORVRAM,   0xFFFFFFFF);
+        check(REX3_ALPHAREF,    0xFF);       // 8-bit
+        check(REX3_SMASK0X,     0xFFFFFFFF);
+        check(REX3_SMASK0Y,     0xFFFFFFFF);
+        check(REX3_XYMOVE,      0xFFFFFFFF);
+        check(REX3_BRESD,       0x7FFFFFF);  // 27-bit
+        check(REX3_BRESS1,      0x1FFFF);    // 17-bit
+        check(REX3_BRESOCTINC1, 0x7FFFFFF & !(0xF << 20));
+        check(REX3_BRESRNDINC2, 0xFFFFFFFF & !(0x7 << 21));
+        check(REX3_BRESE1,      0xFFFF);     // 16-bit
+        check(REX3_BRESS2,      0x3FFFFFF);  // 26-bit
+        check(REX3_AWEIGHT0,    0xFFFFFFFF);
+        check(REX3_AWEIGHT1,    0xFFFFFFFF);
+        check(REX3_COLORRED,    0xFFFFFF);   // 24-bit
+        check(REX3_COLORALPHA,  0xFFFFF);    // 20-bit
+        check(REX3_COLORGRN,    0xFFFFF);    // 20-bit
+        check(REX3_COLORBLUE,   0xFFFFF);    // 20-bit
+        check(REX3_WRMASK,      0xFFFFFF);   // 24-bit
+        check(REX3_SMASK1X,     0xFFFFFFFF);
+        check(REX3_SMASK1Y,     0xFFFFFFFF);
+        check(REX3_SMASK2X,     0xFFFFFFFF);
+        check(REX3_SMASK2Y,     0xFFFFFFFF);
+        check(REX3_SMASK3X,     0xFFFFFFFF);
+        check(REX3_SMASK3Y,     0xFFFFFFFF);
+        check(REX3_SMASK4X,     0xFFFFFFFF);
+        check(REX3_SMASK4Y,     0xFFFFFFFF);
+        check(REX3_TOPSCAN,     0x3FF);      // 10-bit
+        check(REX3_XYWIN,       0xFFFFFFFF);
+        check(REX3_CLIPMODE,    0x1FFF);     // 13-bit
+
+        // SGI TIW tests: XSTARTI (integer) writes into _xstart (fixed-point).
+        // Writing integer x to XSTARTI stores x<<11 in xstart (I21F11).
+        // Mask: lower 16 bits of pattern as i16, shifted <<11.
+        {
+            let xi = (pattern & 0xFFFF) as i16 as i32;
+            reg(&rex, REX3_XSTARTI, pattern);
+            let got = read_reg(&rex, REX3_XSTART);
+            let expect = (xi << 11) as u32 & (0xFFFFF << 7);
+            assert_eq!(got, expect,
+                "XSTARTI→XSTART pattern={pattern:#010x}: got {got:#010x} expected {expect:#010x}");
+        }
+
+        // XYSTARTI packs x and y; both should appear in xstart and ystart.
+        {
+            let xi = ((pattern >> 16) & 0xFFFF) as i16 as i32;
+            let yi = (pattern & 0xFFFF) as i16 as i32;
+            reg(&rex, REX3_XYSTARTI, pattern);
+            let xgot = read_reg(&rex, REX3_XSTART);
+            let ygot = read_reg(&rex, REX3_YSTART);
+            let xexp = (xi << 11) as u32 & (0xFFFFF << 7);
+            let yexp = (yi << 11) as u32 & (0xFFFFF << 7);
+            assert_eq!(xgot, xexp,
+                "XYSTARTI→XSTART pattern={pattern:#010x}: got {xgot:#010x} expected {xexp:#010x}");
+            assert_eq!(ygot, yexp,
+                "XYSTARTI→YSTART pattern={pattern:#010x}: got {ygot:#010x} expected {yexp:#010x}");
+        }
+
+        // XYENDI packs x and y into xend/yend.
+        {
+            let xi = ((pattern >> 16) & 0xFFFF) as i16 as i32;
+            let yi = (pattern & 0xFFFF) as i16 as i32;
+            reg(&rex, REX3_XYENDI, pattern);
+            let xgot = read_reg(&rex, REX3_XEND);
+            let yexp = (yi << 11) as u32 & (0xFFFFF << 7);
+            let xexp = (xi << 11) as u32 & (0xFFFFF << 7);
+            assert_eq!(xgot, xexp,
+                "XYENDI→XEND pattern={pattern:#010x}: got {xgot:#010x} expected {xexp:#010x}");
+            let ygot = read_reg(&rex, REX3_YEND);
+            assert_eq!(ygot, yexp,
+                "XYENDI→YEND pattern={pattern:#010x}: got {ygot:#010x} expected {yexp:#010x}");
+        }
+    }
+
+    rex3init(&rex); // restore
+}
+
+// ============================================================================
+// Tests ported from SGI vram3.c: ng1test_vram() — fill and readback via fb_rgb
+// ============================================================================
+
+/// Port of SGI ng1test_vram() solid fill + readback.
+/// Fills the framebuffer with a pattern color, then reads it back directly
+/// from fb_rgb (in-emulator we skip the hostrw FIFO path and read memory directly).
+#[test]
+fn test_vram_fill_readback_ci8() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // CI 8-bit mode: test patterns 0x00, 0x55, 0xAA, 0xFF
+    for &color in &[0x00u8, 0x55, 0xAA, 0xFF] {
+        // Fill entire (small) region
+        let (x0, y0, x1, y1) = (0i32, 0i32, 63i32, 15i32);
+        reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(&rex, REX3_WRMASK, 0xFF);
+        reg(&rex, REX3_COLORI, color as u32);
+        reg(&rex, REX3_XYENDI,   xy(x1, y1));
+        reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        // Verify every pixel in the region has the correct 8-bit value
+        let mut errors = 0;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let px = read_pixel(&rex, x, y);
+                // In CI8, write_rgb_8 stores value in bits 7:0 of each pixel group.
+                // The actual value stored depends on pixel packing — check low byte.
+                if (px & 0xFF) != color as u32 {
+                    errors += 1;
+                }
+            }
+        }
+        assert_eq!(errors, 0,
+            "CI8 fill with {color:#04x}: {errors} pixels mismatched");
+    }
+}
+
+/// Walking-ones VRAM test (port of vram3.c walking 1's section), CI8 mode.
+#[test]
+fn test_vram_walking_ones_ci8() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    for bit in 0..8u32 {
+        let color = 1u8 << bit;
+        let (x0, y0, x1, y1) = (0i32, 0i32, 31i32, 7i32);
+
+        reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(&rex, REX3_WRMASK, 0xFF);
+        reg(&rex, REX3_COLORI, color as u32);
+        reg(&rex, REX3_XYENDI,   xy(x1, y1));
+        reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        let mut errors = 0;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let px = read_pixel(&rex, x, y) & 0xFF;
+                if px != color as u32 { errors += 1; }
+            }
+        }
+        assert_eq!(errors, 0, "Walking-1 bit {bit} (color={color:#04x}): {errors} mismatches");
+    }
+}
+
+/// VRAM test with varying colors per block (small-chunk section of vram3.c).
+#[test]
+fn test_vram_varying_color_blocks_ci8() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Test a 128×4 region with different colors per 64-pixel-wide column
+    let ysize = 4i32;
+    let (x0, y0) = (0i32, 0i32);
+    for col in 0..2i32 {
+        let x = x0 + col * 64;
+        let color = ((col * 3) & 0xFF) as u8; // simple per-column color
+        reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(&rex, REX3_WRMASK, 0xFF);
+        reg(&rex, REX3_COLORI, color as u32);
+        reg(&rex, REX3_XYENDI,   xy(x + 63, y0 + ysize - 1));
+        reg(&rex, REX3_XYSTARTI, xy(x, y0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        for y in y0..y0+ysize {
+            for px_x in x..x+64 {
+                let px = read_pixel(&rex, px_x, y) & 0xFF;
+                assert_eq!(px, color as u32,
+                    "block col={col} at ({px_x},{y}): got {px:#04x} expected {color:#04x}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Tests ported from minigl3.c: ng1_block, ng1_span, ng1_scrtoscr
+// ============================================================================
+
+/// ng1_block() in CI8 mode: verify that fill writes exactly the right rectangle.
+#[test]
+fn test_ng1_block_boundary() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Fill a background color across the test area
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0xAA);
+    reg(&rex, REX3_XYENDI,   xy(15, 7));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Draw a smaller rectangle with a different color
+    reg(&rex, REX3_COLORI, 0x42);
+    reg(&rex, REX3_XYENDI,   xy(9, 5));
+    reg(&rex, REX3_XYSTARTI, xy(4, 2));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Inside the inner rectangle → 0x42
+    for y in 2..=5 {
+        for x in 4..=9 {
+            assert_eq!(read_pixel(&rex, x, y) & 0xFF, 0x42,
+                "inner pixel ({x},{y}) should be 0x42");
+        }
+    }
+    // Outside the inner rectangle (but inside outer) → 0xAA
+    assert_eq!(read_pixel(&rex, 0, 0) & 0xFF, 0xAA, "outer corner (0,0) should be 0xAA");
+    assert_eq!(read_pixel(&rex, 15, 7) & 0xFF, 0xAA, "outer corner (15,7) should be 0xAA");
+    assert_eq!(read_pixel(&rex, 3, 2) & 0xFF, 0xAA, "left of inner (3,2) should be 0xAA");
+    assert_eq!(read_pixel(&rex, 10, 5) & 0xFF, 0xAA, "right of inner (10,5) should be 0xAA");
+}
+
+/// ng1_span(): single horizontal span draws exactly one row.
+#[test]
+fn test_ng1_span_one_row() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Clear background
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0x00);
+    reg(&rex, REX3_XYENDI,   xy(19, 9));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Draw span at y=4 from x=5 to x=14 (inclusive)
+    reg(&rex, REX3_COLORI, 0x77);
+    reg(&rex, REX3_XYENDI,   xy(14, 4)); // xend only used for STOPONX
+    reg(&rex, REX3_XYSTARTI, xy(5, 4));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_SPAN);
+
+    for x in 5..=14 {
+        assert_eq!(read_pixel(&rex, x, 4) & 0xFF, 0x77, "span pixel ({x},4) should be 0x77");
+    }
+    // Row above and below should be untouched
+    assert_eq!(read_pixel(&rex, 5, 3) & 0xFF, 0x00, "row above span should be 0");
+    assert_eq!(read_pixel(&rex, 5, 5) & 0xFF, 0x00, "row below span should be 0");
+    // Pixel before and after span on same row
+    assert_eq!(read_pixel(&rex, 4, 4) & 0xFF, 0x00, "pixel before span start should be 0");
+    assert_eq!(read_pixel(&rex, 15, 4) & 0xFF, 0x00, "pixel after span end should be 0");
+}
+
+/// ng1_scrtoscr(): copy a block from one location to another.
+/// Port of the SCR2SCR path in minigl3.c/ng1_scrtoscr().
+#[test]
+fn test_ng1_scrtoscr() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Paint source block at (0,0)..(7,7) with color 0xCC
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0xCC);
+    reg(&rex, REX3_XYENDI,   xy(7, 7));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Clear destination area (16,0)..(23,7) to 0
+    reg(&rex, REX3_COLORI, 0x00);
+    reg(&rex, REX3_XYENDI,   xy(23, 7));
+    reg(&rex, REX3_XYSTARTI, xy(16, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // SCR2SCR: copy (0,0)..(7,7) → (16,0)..(23,7) via XYMOVE=(16,0)
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_XYMOVE, (16u32 << 16) | 0);  // x_move=16, y_move=0
+    reg(&rex, REX3_XYENDI,   xy(7, 7));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_SCR2SCR);
+
+    // Destination should now contain 0xCC
+    let mut errors = 0;
+    for y in 0..=7 {
+        for x in 16..=23 {
+            let px = read_pixel(&rex, x, y) & 0xFF;
+            if px != 0xCC { errors += 1; }
+        }
+    }
+    assert_eq!(errors, 0, "SCR2SCR: {errors} destination pixels wrong (expected 0xCC)");
+
+    // Source should be unchanged
+    for y in 0..=7 {
+        for x in 0..=7 {
+            assert_eq!(read_pixel(&rex, x, y) & 0xFF, 0xCC,
+                "SCR2SCR: source ({x},{y}) should still be 0xCC");
+        }
+    }
+}
+
+/// SCR2SCR with a non-zero Y offset.
+#[test]
+fn test_ng1_scrtoscr_y_offset() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Paint source (0,0)..(7,3) = color 0x33
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0x33);
+    reg(&rex, REX3_XYENDI,   xy(7, 3));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // SCR2SCR: copy (0,0)..(7,3) → (0,8)..(7,11) via XYMOVE=(0,8)
+    reg(&rex, REX3_XYMOVE, (0u32 << 16) | 8);
+    reg(&rex, REX3_XYENDI,   xy(7, 3));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_SCR2SCR);
+
+    for y in 8..=11 {
+        for x in 0..=7 {
+            assert_eq!(read_pixel(&rex, x, y) & 0xFF, 0x33,
+                "SCR2SCR Y-offset: ({x},{y}) should be 0x33");
+        }
+    }
+}
+
+// ============================================================================
+// Additional focused regression tests
+// ============================================================================
+
+/// Basic single-pixel CI8 draw — simplest possible drawing test.
+#[test]
+fn test_block_fill_single_pixel() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0xAB);
+    reg(&rex, REX3_XYENDI,   xy(10, 20));
+    reg(&rex, REX3_XYSTARTI, xy(10, 20));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_eq!(read_pixel(&rex, 10, 20) & 0xFF, 0xAB);
+}
+
+/// WRMASK=0 must block all writes.
+#[test]
+fn test_wrmask_zero_blocks_write() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0x00);
+    reg(&rex, REX3_COLORI, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(3, 3));
+    reg(&rex, REX3_XYSTARTI, xy(3, 3));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_eq!(read_pixel(&rex, 3, 3), 0, "wrmask=0 should block all writes");
+}
+
+/// Partial write mask — only masked bits written.
+#[test]
+fn test_wrmask_partial() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0x0F);  // low nibble only
+    reg(&rex, REX3_COLORI, 0xFF);   // would write FF, but only 0F lands
+    reg(&rex, REX3_XYENDI,   xy(1, 1));
+    reg(&rex, REX3_XYSTARTI, xy(1, 1));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_eq!(read_pixel(&rex, 1, 1) & 0xFF, 0x0F);
+}
+
+/// LOGICOP_ZERO always produces 0, regardless of source color.
+#[test]
+fn test_logicop_zero_clears() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // First paint with SRC
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0xDE);
+    reg(&rex, REX3_XYENDI,   xy(4, 4));
+    reg(&rex, REX3_XYSTARTI, xy(4, 4));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_ne!(read_pixel(&rex, 4, 4) & 0xFF, 0);
+
+    // Clear with ZERO logicop
+    let dm1_zero = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_ZERO;
+    reg(&rex, REX3_DRAWMODE1, dm1_zero);
+    reg(&rex, REX3_COLORI, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(4, 4));
+    reg(&rex, REX3_XYSTARTI, xy(4, 4));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_eq!(read_pixel(&rex, 4, 4) & 0xFF, 0, "LOGICOP_ZERO should write 0");
+}
+
+/// XOR twice with same color returns to zero.
+#[test]
+fn test_logicop_xor_roundtrip() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm1_xor = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_XOR;
+
+    reg(&rex, REX3_DRAWMODE1, dm1_xor);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0x55);
+    reg(&rex, REX3_XYENDI,   xy(2, 2));
+    reg(&rex, REX3_XYSTARTI, xy(2, 2));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_ne!(read_pixel(&rex, 2, 2) & 0xFF, 0, "first XOR should be non-zero");
+
+    reg(&rex, REX3_XYENDI,   xy(2, 2));
+    reg(&rex, REX3_XYSTARTI, xy(2, 2));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_eq!(read_pixel(&rex, 2, 2) & 0xFF, 0, "XOR twice should return to 0");
+}
+
+/// Draw at the rightmost valid screen column.
+#[test]
+fn test_draw_at_right_edge() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let x = REX3_SCREEN_WIDTH - 1;
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0x42);
+    reg(&rex, REX3_XYENDI,   xy(x, 0));
+    reg(&rex, REX3_XYSTARTI, xy(x, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    assert_eq!(read_pixel(&rex, x, 0) & 0xFF, 0x42);
+}
+
+/// Draw one past the right edge — must not panic, pixel stays unwritten.
+#[test]
+fn test_draw_past_right_edge_clipped() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0x77);
+    let x = REX3_SCREEN_WIDTH;
+    reg(&rex, REX3_XYENDI,   xy(x, 0));
+    reg(&rex, REX3_XYSTARTI, xy(x, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    // No assert — just no panic
+}
+
+/// NOOP opcode draws nothing even with valid coordinates.
+#[test]
+fn test_noop_opcode_draws_nothing() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(5, 5));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    let dm0_noop = DRAWMODE0_OPCODE_NOOP | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+    reg_go(&rex, REX3_DRAWMODE0, dm0_noop);
+    for y in 0..=5 {
+        for x in 0..=5 {
+            assert_eq!(read_pixel(&rex, x, y), 0, "NOOP should write no pixels");
+        }
+    }
+}
+
+/// XYSTARTI/XYENDI updates xstart/ystart and xend/yend in context.
+#[test]
+fn test_register_state_update() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xDEADBEEF & 0xFFFFFF);
+    reg(&rex, REX3_XYMOVE, 0x00030004);
+    wait(&rex);
+    assert_eq!(read_reg(&rex, REX3_DRAWMODE1), DM1_CI8_SRC);
+    assert_eq!(read_reg(&rex, REX3_WRMASK), 0xDEADBEEF & 0xFFFFFF);
+    assert_eq!(read_reg(&rex, REX3_XYMOVE), 0x00030004);
+}
+
+// ============================================================================
+// Tests ported from SGI rex3patterns.c: ng1bars, ng1patterns
+// ============================================================================
+
+/// Port of ng1bars(): CI8 vertical color bars with per-column color index.
+/// Fills N equal-width columns with color i % 256, verifies center pixel of each.
+#[test]
+fn test_ng1bars_ci8() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Use 4 columns of width 8 for speed
+    let width = 8i32;
+    let num_bars = 4;
+    let ysize = 15i32;
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+
+    for i in 0..num_bars {
+        let x = i * width;
+        let color = (i % 256) as u8;
+        reg(&rex, REX3_COLORI, color as u32);
+        reg(&rex, REX3_XYENDI,   xy(x + width - 1, ysize - 1));
+        reg(&rex, REX3_XYSTARTI, xy(x, 0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    }
+
+    for i in 0..num_bars {
+        let x = i * width;
+        let color = (i % 256) as u32;
+        // Check center pixel of each bar
+        let cx = x + width / 2;
+        let cy = ysize / 2;
+        let px = read_pixel(&rex, cx, cy) & 0xFF;
+        assert_eq!(px, color, "CI8 bar {i}: center ({cx},{cy}) got {px:#04x} expected {color:#04x}");
+        // Check all pixels in bar
+        for y in 0..ysize {
+            for bx in x..x+width {
+                let p = read_pixel(&rex, bx, y) & 0xFF;
+                assert_eq!(p, color, "CI8 bar {i}: ({bx},{y}) got {p:#04x} expected {color:#04x}");
+            }
+        }
+    }
+}
+
+/// Port of ng1patterns() solid fill tests: black, gray (128,128,128), white (255,255,255).
+/// Verifies that RGB24 block fills produce the correct pixel value.
+#[test]
+fn test_patterns_rgb24_solid_fills() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let (x0, y0, x1, y1) = (0i32, 0i32, 31i32, 15i32);
+
+    // Helper: fill region in RGB24, check a few pixels.
+    // Matches ng1_rgbcolor(r,g,b): colorred.word = r<<11, colorgrn.word = g<<11, colorblue.word = b<<11
+    // COLORRED/GRN/BLUE are o12.11 format; integer r stored at bits [22:11].
+    let test_fill = |r: u32, g: u32, b: u32| {
+        reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(&rex, REX3_WRMASK, 0xFFFFFF);
+        reg(&rex, REX3_COLORRED,  r << 11);
+        reg(&rex, REX3_COLORGRN,  g << 11);
+        reg(&rex, REX3_COLORBLUE, b << 11);
+        reg(&rex, REX3_XYENDI,   xy(x1, y1));
+        reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        let expected = (b << 16) | (g << 8) | r;
+        let mut errors = 0;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let px = read_pixel(&rex, x, y) & 0xFFFFFF;
+                if px != expected { errors += 1; }
+            }
+        }
+        assert_eq!(errors, 0,
+            "RGB24 fill ({r},{g},{b}): {errors} pixels wrong (expected {expected:#08x})");
+    };
+
+    test_fill(0, 0, 0);         // Black
+    test_fill(128, 128, 128);   // Gray
+    test_fill(255, 255, 255);   // White
+}
+
+/// Port of ng1patterns() nested block tests:
+/// black background with white center block, then white background with black center.
+#[test]
+fn test_patterns_rgb24_nested_blocks() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+
+    let (sw, sh) = (32i32, 16i32);  // small screen size for test
+
+    // --- Black background + white center ---
+    // ng1_rgbcolor: colorred.word = r<<11, etc. (o12.11 format, integer in bits [22:11])
+    reg(&rex, REX3_COLORRED,  0 << 11);
+    reg(&rex, REX3_COLORGRN,  0 << 11);
+    reg(&rex, REX3_COLORBLUE, 0 << 11);
+    reg(&rex, REX3_XYENDI,   xy(sw-1, sh-1));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    reg(&rex, REX3_COLORRED,  255 << 11);
+    reg(&rex, REX3_COLORGRN,  255 << 11);
+    reg(&rex, REX3_COLORBLUE, 255 << 11);
+    let (cx0, cy0, cx1, cy1) = (sw/4, sh/4, 3*sw/4, 3*sh/4);
+    reg(&rex, REX3_XYENDI,   xy(cx1, cy1));
+    reg(&rex, REX3_XYSTARTI, xy(cx0, cy0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Center of inner block should be white
+    assert_eq!(read_pixel(&rex, sw/2, sh/2) & 0xFFFFFF, 0xFFFFFF,
+        "nested black+white: center should be white");
+    // Corners of outer block should be black
+    assert_eq!(read_pixel(&rex, 0, 0) & 0xFFFFFF, 0x000000,
+        "nested black+white: corner (0,0) should be black");
+    assert_eq!(read_pixel(&rex, sw-1, sh-1) & 0xFFFFFF, 0x000000,
+        "nested black+white: corner (sw-1,sh-1) should be black");
+    // Pixel just inside inner rectangle boundary
+    assert_eq!(read_pixel(&rex, cx0, cy0) & 0xFFFFFF, 0xFFFFFF,
+        "nested black+white: inner top-left corner should be white");
+
+    // --- White background + black center ---
+    reg(&rex, REX3_COLORRED,  255 << 11);
+    reg(&rex, REX3_COLORGRN,  255 << 11);
+    reg(&rex, REX3_COLORBLUE, 255 << 11);
+    reg(&rex, REX3_XYENDI,   xy(sw-1, sh-1));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    reg(&rex, REX3_COLORRED,  0 << 11);
+    reg(&rex, REX3_COLORGRN,  0 << 11);
+    reg(&rex, REX3_COLORBLUE, 0 << 11);
+    reg(&rex, REX3_XYENDI,   xy(cx1, cy1));
+    reg(&rex, REX3_XYSTARTI, xy(cx0, cy0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    assert_eq!(read_pixel(&rex, sw/2, sh/2) & 0xFFFFFF, 0x000000,
+        "nested white+black: center should be black");
+    assert_eq!(read_pixel(&rex, 0, 0) & 0xFFFFFF, 0xFFFFFF,
+        "nested white+black: corner (0,0) should be white");
+}
+
+/// Port of ng1patterns() 8-color-bar test in RGB24 mode.
+/// Colors: black, red, green, yellow, blue, magenta, cyan, white.
+/// Each bar spans 1/8 of the screen width (using width=16 per bar for test).
+#[test]
+fn test_patterns_rgb24_color_bars() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+
+    // 8 bars, width=16 each, height=8
+    let bar_w = 16i32;
+    let bar_h = 8i32;
+
+    // SGI ng1patterns color sequence
+    let colors: &[(u32, u32, u32)] = &[
+        (0,   0,   0  ),  // black
+        (255, 0,   0  ),  // red
+        (0,   255, 0  ),  // green
+        (255, 255, 0  ),  // yellow
+        (0,   0,   255),  // blue
+        (255, 0,   255),  // magenta
+        (0,   255, 255),  // cyan
+        (255, 255, 255),  // white
+    ];
+
+    for (i, &(r, g, b)) in colors.iter().enumerate() {
+        let x0 = i as i32 * bar_w;
+        // ng1_rgbcolor: colorred.word = r<<11, colorgrn.word = g<<11, colorblue.word = b<<11
+        reg(&rex, REX3_COLORRED,  r << 11);
+        reg(&rex, REX3_COLORGRN,  g << 11);
+        reg(&rex, REX3_COLORBLUE, b << 11);
+        reg(&rex, REX3_XYENDI,   xy(x0 + bar_w - 1, bar_h - 1));
+        reg(&rex, REX3_XYSTARTI, xy(x0, 0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    }
+
+    for (i, &(r, g, b)) in colors.iter().enumerate() {
+        let x0 = i as i32 * bar_w;
+        let expected = (b << 16) | (g << 8) | r;
+        // Check center pixel of each bar
+        let cx = x0 + bar_w / 2;
+        let cy = bar_h / 2;
+        let px = read_pixel(&rex, cx, cy) & 0xFFFFFF;
+        assert_eq!(px, expected,
+            "RGB24 color bar {i} ({r},{g},{b}): center ({cx},{cy}) got {px:#08x} expected {expected:#08x}");
+    }
+}
+
+/// Port of ng1_polygon() Gouraud shading: draw a shaded span in RGB24 mode.
+/// Sets starting color (red=0) and slope (slopered = 1 per pixel), draws a span,
+/// then verifies each pixel steps by the expected slope.
+///
+/// The shade bit (DM0 bit 18) enables per-pixel color += slope DDA.
+/// colorred and slopered are plain u32/i32 in o12.11 format.
+/// Each pixel: colorred += slopered (wrapping integer add). Integer part = colorred >> 11.
+#[test]
+fn test_patterns_gouraud_shade_span() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let span_len = 8i32;    // pixels to draw
+    let start_r  = 10u32;   // starting red value (integer)
+    let slope_r  = 5u32;    // per-pixel increment in integer units
+
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+
+    // Set starting color: colorred = start_r, colorgrn=0, colorblue=0
+    // ng1_rgbcolor encoding: integer r stored at bits [22:11] of COLORRED (o12.11 format)
+    reg(&rex, REX3_COLORRED,  start_r << 11);
+    reg(&rex, REX3_COLORGRN,  0);
+    reg(&rex, REX3_COLORBLUE, 0);
+
+    // Set slope via register writes.
+    // SLOPERED: s(7)12.11 write format — positive integer n = n<<11 with sign bit clear.
+    // SLOPEGRN/SLOPEBLUE: s(11)8.11 format — same encoding for positive values.
+    reg(&rex, REX3_SLOPERED,  slope_r << 11);
+    reg(&rex, REX3_SLOPEGRN,  0);
+    reg(&rex, REX3_SLOPEBLUE, 0);
+
+    // DM0 with shade bit (bit 18) + STOPONX span
+    let dm0_shade_span = DM0_DRAW_SPAN | (1 << 18);
+
+    reg(&rex, REX3_XYENDI,   xy(span_len - 1, 0));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, dm0_shade_span);
+
+    // Verify each pixel: pixel x should have red = start_r + x * slope_r
+    // (shade increments AFTER writing each pixel, so pixel 0 = start_r)
+    for x in 0..span_len {
+        let expected_r = start_r + x as u32 * slope_r;
+        let px = read_pixel(&rex, x, 0);
+        let got_r = px & 0xFF;
+        assert_eq!(got_r, expected_r,
+            "shade span x={x}: red got {got_r} expected {expected_r}");
+        // green and blue should be 0
+        let got_g = (px >> 8) & 0xFF;
+        let got_b = (px >> 16) & 0xFF;
+        assert_eq!(got_g, 0, "shade span x={x}: green should be 0, got {got_g}");
+        assert_eq!(got_b, 0, "shade span x={x}: blue should be 0, got {got_b}");
+    }
+}
+
+// ============================================================================
+// HOSTRW tests — ported from SGI vram3.c (ng1test_vram, ng1rvram, ng1wvram,
+//                ng1test_vram_addr, ng1giobustest, ng1spfastclear).
+//
+// Two HOSTRW directions:
+//   HOSTR (READ):  REX reads fb → host read FIFO → CPU reads via read_hostrw32/64.
+//                  DM0 = OPCODE_READ | ADRMODE_BLOCK | STOPONXY | COLORHOST | DOSETUP.
+//   HOSTW (WRITE): CPU writes raw pixel words to HOSTRW0 → REX draws into fb.
+//                  DM0 = OPCODE_DRAW | ADRMODE_BLOCK | STOPONXY | COLORHOST.
+//
+// HOSTRW register write (SET space, no GO): walks test data through the loopback
+//   path — REX3 sets.hostrw0/1 = data; REX3 go.hostrw0/1 reads it back.
+//   This is the ng1giobustest pattern.
+//
+// 32-bit vs 64-bit:
+//   32-bit: write32(go_addr(REX3_HOSTRW0), val32) / read_hostrw32()
+//   64-bit: write64(go_addr(REX3_HOSTRW0), val64) / read_hostrw64()
+//           Requires DM1_RWDOUBLE in drawmode1.
+// ============================================================================
+
+// DM1 values with host-depth and packed/double flags
+// CI8: hostdepth=1 (8bpp), rwpacked (bit 7), same draw-plane config as DM1_CI8_SRC
+const DM1_CI8_HOSTRW: u32 =
+    DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC | (1 << 8) | (1 << 7);
+// CI8 64-bit: same as CI8 + rwdouble (bit 10) → 8 CI8 pixels per 64-bit word
+const DM1_CI8_HOSTRW64: u32 = DM1_CI8_HOSTRW | (1 << 10);
+// RGB24: hostdepth=3 (32bpp), rwpacked (bit 7), same draw-plane as DM1_RGB24_SRC
+const DM1_RGB24_HOSTRW: u32 =
+    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC | (3 << 8) | (1 << 7);
+// RGB24 64-bit: same as above + rwdouble (bit 10)
+const DM1_RGB24_HOSTRW64: u32 = DM1_RGB24_HOSTRW | (1 << 10);
+
+// ============================================================================
+// GIO bus loopback (ng1giobustest):
+// Write to SET.hostrw0/1, read back from SET.hostrw0/1 after drain.
+// SET write routes through GFIFO (async), so wait_idle() before reading back.
+// ============================================================================
+
+/// Port of ng1giobustest(): walk a 1 through all 32 bits of HOSTRW0 via SET path.
+#[test]
+fn test_hostrw_gio_bus_walking_ones_32bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    for b in 0..32u32 {
+        let w = 1u32 << b;
+        rex.write32(set_addr(REX3_HOSTRW0), w);
+        // SET read: wait for GFIFO to drain, then return hostrw register.
+        let got = loop {
+            let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW0));
+            if r.is_ok() { break r.data; }
+            std::hint::spin_loop();
+        };
+        assert_eq!(got, w, "HOSTRW0 SET loopback bit {b}: got {got:#010x} expected {w:#010x}");
+    }
+}
+
+/// Same for HOSTRW1.
+#[test]
+fn test_hostrw_gio_bus_walking_ones_hostrw1() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    for b in 0..32u32 {
+        let w = 1u32 << b;
+        rex.write32(set_addr(REX3_HOSTRW1), w);
+        let got = loop {
+            let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW1));
+            if r.is_ok() { break r.data; }
+            std::hint::spin_loop();
+        };
+        assert_eq!(got, w, "HOSTRW1 SET loopback bit {b}: got {got:#010x} expected {w:#010x}");
+    }
+}
+
+// ============================================================================
+// HOSTR (fb → host) tests — READ opcode.
+//
+// Protocol (matches SGI vram3.c / newport_accel.c):
+//   1. Set up registers (DM1, XYENDI) in SET space.
+//   2. Write DM0 = DM0_READ_BLOCK to GO space → triggers first batch → hostrw = word0.
+//      (Or write XYSTARTI to GO space with DM0 already set.)
+//   3. read_hostrw32(GO) → returns word[i], enqueues pure_go → next batch runs → hostrw = word[i+1].
+//   4. For the last word: read_hostrw32_last(SET) → returns word[N-1], no extra batch.
+// ============================================================================
+
+/// CI8 HOSTR 32-bit: fill a small region, issue READ block, drain word by word.
+/// CI8 + rwpacked: 4 CI8 pixels per 32-bit word.
+#[test]
+fn test_hostr_ci8_read_block_32bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let color = 0x5Au8;
+    let (x0, y0, x1, y1) = (0i32, 0i32, 15i32, 3i32);
+
+    // Fill region via normal draw
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, color as u32);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Set up READ block: DM1 + XYENDI in SET space, DM0 to GO triggers first batch.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    // CI8 rwpacked: 4 pixels per 32-bit word.
+    let width = (x1 - x0 + 1) as u32;
+    let height = (y1 - y0 + 1) as u32;
+    let words = width * height / 4;
+
+    let expected_word = (color as u32)
+        | ((color as u32) << 8)
+        | ((color as u32) << 16)
+        | ((color as u32) << 24);
+
+    for i in 0..words {
+        let got = if i < words - 1 { read_hostrw32(&rex) } else { read_hostrw32_last(&rex) };
+        assert_eq!(got, expected_word,
+            "CI8 HOSTR word {i}: got {got:#010x} expected {expected_word:#010x}");
+    }
+}
+
+/// RGB24 HOSTR 32-bit: fill a small region, issue READ block, verify each 32-bit word.
+/// RGB24 + hostdepth32: 1 pixel per 32-bit word.
+#[test]
+fn test_hostr_rgb24_read_block_32bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let (r, g, b) = (0xAAu32, 0x55u32, 0xCCu32);
+    let (x0, y0, x1, y1) = (0i32, 0i32, 3i32, 1i32);
+
+    // Fill with RGB24
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_COLORRED,  r << 11);
+    reg(&rex, REX3_COLORGRN,  g << 11);
+    reg(&rex, REX3_COLORBLUE, b << 11);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Issue READ block: DM0 GO triggers first batch.
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    let width  = (x1 - x0 + 1) as u32;
+    let height = (y1 - y0 + 1) as u32;
+    let words  = width * height;  // 1 pixel per word
+
+    let expected = (b << 16) | (g << 8) | r;
+    for i in 0..words {
+        let got = if i < words - 1 { read_hostrw32(&rex) } else { read_hostrw32_last(&rex) };
+        assert_eq!(got & 0xFFFFFF, expected,
+            "RGB24 HOSTR word {i}: got {got:#08x} expected {expected:#08x}");
+    }
+}
+
+/// Multi-color HOSTR readback: fill each row with a different color, read back per-row.
+#[test]
+fn test_hostr_rgb24_multicolor_readback() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let (x0, x1) = (0i32, 3i32);
+    let colors: &[(u32, u32, u32)] = &[
+        (0xFF, 0x00, 0x00),  // row 0: red
+        (0x00, 0xFF, 0x00),  // row 1: green
+        (0x00, 0x00, 0xFF),  // row 2: blue
+        (0xAA, 0x55, 0xCC),  // row 3: mixed
+    ];
+
+    // Fill each row
+    for (row, &(r, g, b)) in colors.iter().enumerate() {
+        let y = row as i32;
+        reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+        reg(&rex, REX3_WRMASK, 0xFFFFFF);
+        reg(&rex, REX3_COLORRED,  r << 11);
+        reg(&rex, REX3_COLORGRN,  g << 11);
+        reg(&rex, REX3_COLORBLUE, b << 11);
+        reg(&rex, REX3_XYENDI,   xy(x1, y));
+        reg(&rex, REX3_XYSTARTI, xy(x0, y));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    }
+
+    // Read back each row individually.
+    let width = (x1 - x0 + 1) as u32;  // 4 pixels → 4 words (1 per word, RGB32)
+    for (row, &(r, g, b)) in colors.iter().enumerate() {
+        let y = row as i32;
+        reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+        reg(&rex, REX3_XYENDI,   xy(x1, y));
+        reg(&rex, REX3_XYSTARTI, xy(x0, y));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+        let expected = (b << 16) | (g << 8) | r;
+        for x in 0..width {
+            let got = if x < width - 1 { read_hostrw32(&rex) } else { read_hostrw32_last(&rex) };
+            assert_eq!(got & 0xFFFFFF, expected,
+                "row {row} x={x}: got {got:#08x} expected {expected:#08x} ({r},{g},{b})");
+        }
+    }
+}
+
+// ============================================================================
+// HOSTW (host → fb) tests — DRAW opcode with COLORHOST.
+//
+// Protocol (matches SGI newport_accel.c / ng1wvram()):
+//   1. Set up DM1 + WRMASK + XYENDI + XYSTARTI + DM0 in SET space (enqueued in order).
+//   2. write_hostrw32(GO, pixel[0]) → stores pixel[0] in hostrw, triggers batch 0
+//      (one word's worth of pixels drawn, xstart advanced).
+//   3. write_hostrw32(GO, pixel[1]) → batch 1, etc.
+//   No separate DM0 GO needed — each HOSTRW GO is self-contained.
+// ============================================================================
+
+/// CI8 HOSTW 32-bit: write 4 pixels packed into one 32-bit word.
+/// CI8 + rwpacked + hostdepth8: 4 CI8 pixels per word (MSB first).
+#[test]
+fn test_hostw_ci8_write_block_32bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Pixels: [x=0]=0x11, [x=1]=0x22, [x=2]=0x33, [x=3]=0x44
+    // CI8 unpack_8_32_ci: pixel = (shifter >> 24) & 0xFF, shift left 8 per pixel.
+    // 32-bit word loaded as upper 32 bits of u64 shifter for 32-bit mode.
+    // Wait — for 32-bit non-rwdouble: host_shifter = val as u64 (zero-extended lower 32).
+    // unpack_8_32_ci = ((val as u32) >> 24) & 0xFF = MSB of the 32-bit word.
+    // So pack as: pixel0 in MSB, pixel3 in LSB: word = (p0<<24)|(p1<<16)|(p2<<8)|p3.
+    let word: u32 = (0x11u32 << 24) | (0x22 << 16) | (0x33 << 8) | 0x44;
+
+    // Setup in SET space, then one HOSTRW GO triggers the single-word batch.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(3, 0));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);  // SET — loads mode, no draw
+    write_hostrw32(&rex, word);   // GO — triggers batch (4 pixels)
+    wait(&rex);
+
+    assert_eq!(read_pixel(&rex, 0, 0) & 0xFF, 0x11, "CI8 HOSTW x=0");
+    assert_eq!(read_pixel(&rex, 1, 0) & 0xFF, 0x22, "CI8 HOSTW x=1");
+    assert_eq!(read_pixel(&rex, 2, 0) & 0xFF, 0x33, "CI8 HOSTW x=2");
+    assert_eq!(read_pixel(&rex, 3, 0) & 0xFF, 0x44, "CI8 HOSTW x=3");
+}
+
+/// RGB24 HOSTW 32-bit: write one pixel per 32-bit GO write.
+/// RGB24 + hostdepth32: 1 pixel per word.
+#[test]
+fn test_hostw_rgb24_write_block_32bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let pixels: &[u32] = &[0x0000FF, 0x00FF00, 0xFF0000, 0xAABBCC];
+    let width = pixels.len() as i32;
+
+    // Setup in SET space: DM1 + WRMASK + coords + DM0, then one GO per pixel.
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_XYENDI,   xy(width - 1, 0));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);  // SET — no draw yet
+    for &p in pixels {
+        write_hostrw32(&rex, p);  // each GO triggers one pixel draw
+    }
+    wait(&rex);
+
+    for (i, &p) in pixels.iter().enumerate() {
+        let got = read_pixel(&rex, i as i32, 0) & 0xFFFFFF;
+        assert_eq!(got, p & 0xFFFFFF,
+            "RGB24 HOSTW pixel[{i}]: got {got:#08x} expected {p:#08x}");
+    }
+}
+
+/// RGB24 HOSTW 64-bit: write two pixels per 64-bit GO write.
+/// RWDOUBLE: high 32 bits = first pixel, low 32 bits = second pixel.
+#[test]
+fn test_hostw_rgb24_write_block_64bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // p0=blue (0xFF0000 in BGR), p1=green (0x00FF00 in BGR)
+    let p0: u32 = 0x00FF0000;
+    let p1: u32 = 0x0000FF00;
+    let word64: u64 = ((p0 as u64) << 32) | (p1 as u64);
+
+    // Setup in SET space, then one 64-bit GO write draws both pixels.
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW64);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_XYENDI,   xy(1, 0));
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);  // SET
+    write_hostrw64(&rex, word64);  // GO — triggers 2-pixel batch
+    wait(&rex);
+
+    let got0 = read_pixel(&rex, 0, 0) & 0xFFFFFF;
+    let got1 = read_pixel(&rex, 1, 0) & 0xFFFFFF;
+    assert_eq!(got0, p0 & 0xFFFFFF,
+        "RGB24 HOSTW64 pixel[0]: got {got0:#08x} expected {p0:#08x}");
+    assert_eq!(got1, p1 & 0xFFFFFF,
+        "RGB24 HOSTW64 pixel[1]: got {got1:#08x} expected {p1:#08x}");
+}
+
+/// RGB24 HOSTR 64-bit: fill a region, issue READ block, drain with read_hostrw64().
+/// RWDOUBLE packs two pixels per 64-bit word: high 32 bits = first pixel.
+#[test]
+fn test_hostr_rgb24_read_block_64bit() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let (r, g, b) = (0x12u32, 0x34u32, 0x56u32);
+    let (x0, y0, x1, y1) = (0i32, 0i32, 3i32, 0i32);  // 4 pixels, 1 row → 2 words
+
+    // Fill
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW64);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_COLORRED,  r << 11);
+    reg(&rex, REX3_COLORGRN,  g << 11);
+    reg(&rex, REX3_COLORBLUE, b << 11);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Issue READ block: DM0 GO triggers first batch (2 pixels packed into 1 word).
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW64);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    let expected_px = (b << 16) | (g << 8) | r;
+    let words = 2u32;  // 4 pixels / 2 per word
+
+    for i in 0..words {
+        let got = if i < words - 1 { read_hostrw64(&rex) } else { read_hostrw64_last(&rex) };
+        let hi = (got >> 32) as u32 & 0xFFFFFF;
+        let lo = got as u32 & 0xFFFFFF;
+        assert_eq!(hi, expected_px,
+            "HOSTR64 word {i} hi: got {hi:#08x} expected {expected_px:#08x}");
+        assert_eq!(lo, expected_px,
+            "HOSTR64 word {i} lo: got {lo:#08x} expected {expected_px:#08x}");
+    }
+}
+
+/// HOSTR+HOSTW round-trip: write pixels via HOSTW (one GO per pixel), read back via HOSTR.
+#[test]
+fn test_hostrw_roundtrip_rgb24() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let (x0, y0, x1, y1) = (0i32, 0i32, 3i32, 1i32);
+    let width  = (x1 - x0 + 1) as usize;
+    let height = (y1 - y0 + 1) as usize;
+
+    // Unique per-pixel values
+    let mut pixels = vec![0u32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            pixels[y * width + x] = (y as u32 * 0x10 + x as u32) * 0x010203 & 0xFFFFFF;
+        }
+    }
+
+    // HOSTW: setup in SET space, then one GO per pixel.
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);  // SET — loads draw mode
+    for &p in &pixels {
+        write_hostrw32(&rex, p);  // GO — draws one pixel
+    }
+    wait(&rex);
+
+    // HOSTR: DM0 GO triggers first batch, subsequent GO reads advance.
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    let n = pixels.len() as u32;
+    for (i, &expected) in pixels.iter().enumerate() {
+        let got = if (i as u32) < n - 1 { read_hostrw32(&rex) } else { read_hostrw32_last(&rex) };
+        assert_eq!(got & 0xFFFFFF, expected & 0xFFFFFF,
+            "roundtrip pixel[{i}]: got {got:#08x} expected {expected:#08x}");
+    }
+}
+
+// ============================================================================
+// HOSTR/HOSTW partial-word (span-end clamping) tests.
+//
+// Confirmed via MAME newport.cpp do_pixel_word_read():
+//   width = min(x_end - x_start + 1, max_width)
+// A span narrower than max_width reads fewer pixels; result is left-aligned
+// (MSB-first) with zero-padding in unused LSB slots — no y-wrap occurs.
+//
+// For HOSTW: if span < host_count, the extra host pixels are simply unused.
+// For HOSTR: flush_host_pixel() left-aligns the partial word before storing.
+// ============================================================================
+
+/// CI8 HOSTR partial word: 3-pixel-wide span (< 4 pixels/word).
+/// Expects one flush with 3 pixels left-aligned and one zero byte at LSB.
+#[test]
+fn test_hostr_ci8_partial_word() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Fill 3 pixels at y=0 with distinct colors
+    for x in 0i32..3 {
+        reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(&rex, REX3_WRMASK, 0xFF);
+        reg(&rex, REX3_COLORI, (x as u32 + 1) * 0x11);  // 0x11, 0x22, 0x33
+        reg(&rex, REX3_XYENDI,   xy(x, 0));
+        reg(&rex, REX3_XYSTARTI, xy(x, 0));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    }
+
+    // Issue READ block for 3-pixel span: one partial word (3 of 4 slots filled).
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(&rex, REX3_XYENDI,   xy(2, 0));  // x0=0, x1=2 → width=3
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    // Expect: pixels packed MSB-first, last byte = 0 (unused).
+    // host_pack_8_ci: (acc<<8)|pixel — after 3 pixels: p0<<16 | p1<<8 | p2
+    // flush shifts left by 1*8 more: (p0<<24)|(p1<<16)|(p2<<8)|0x00
+    let got = read_hostrw32_last(&rex);
+    assert_eq!((got >> 24) & 0xFF, 0x11, "CI8 partial HOSTR: pixel0={:#04x}", (got>>24)&0xFF);
+    assert_eq!((got >> 16) & 0xFF, 0x22, "CI8 partial HOSTR: pixel1={:#04x}", (got>>16)&0xFF);
+    assert_eq!((got >> 8)  & 0xFF, 0x33, "CI8 partial HOSTR: pixel2={:#04x}", (got>>8)&0xFF);
+    assert_eq!( got        & 0xFF, 0x00, "CI8 partial HOSTR: unused LSB should be 0");
+}
+
+/// CI8 HOSTW partial word: 3-pixel-wide span (< 4 pixels/word).
+/// Only the first 3 pixels of the host word are drawn; the 4th is unused.
+/// No y-wrap: pixels after x_end are NOT written.
+#[test]
+fn test_hostw_ci8_partial_word() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Pack 4 CI8 pixels in word but only draw 3 (x=0..2).
+    // host_unpack_8_32_ci: pixel = (shifter >> 24) & 0xFF, then shift left 8.
+    // Pixels in order: p0=0x11 (MSB), p1=0x22, p2=0x33, p3=0x44 (unused).
+    let word: u32 = (0x11u32 << 24) | (0x22 << 16) | (0x33 << 8) | 0x44;
+
+    // Write pixel at x=3 with a sentinel (to confirm it's NOT overwritten by p3=0x44).
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0xAA);
+    reg(&rex, REX3_XYENDI,   xy(3, 0));
+    reg(&rex, REX3_XYSTARTI, xy(3, 0));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // HOSTW 3-pixel span: only x=0,1,2 drawn; x=3 (p3=0x44) must NOT be written.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(2, 0));  // x_end = 2 → span stops after pixel 2
+    reg(&rex, REX3_XYSTARTI, xy(0, 0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);  // SET
+    write_hostrw32(&rex, word);  // GO — draws 3 pixels (span end clamps to x=2)
+    wait(&rex);
+
+    assert_eq!(read_pixel(&rex, 0, 0) & 0xFF, 0x11, "HOSTW partial: x=0 should be 0x11");
+    assert_eq!(read_pixel(&rex, 1, 0) & 0xFF, 0x22, "HOSTW partial: x=1 should be 0x22");
+    assert_eq!(read_pixel(&rex, 2, 0) & 0xFF, 0x33, "HOSTW partial: x=2 should be 0x33");
+    assert_eq!(read_pixel(&rex, 3, 0) & 0xFF, 0xAA, "HOSTW partial: x=3 sentinel should be 0xAA (unused p3 not drawn)");
+}
+
+// ============================================================================
+// Multi-word, multi-row HOSTW tests.
+//
+// These exercise the full DMA-style write path that IRIX uses for blit/image
+// transfers: multiple rows, multiple host-write words per row.
+//
+// CI8 packed (32-bit): 4 CI8 pixels per 32-bit word → 2 words per 8-pixel row.
+// RGB24 unpacked (32-bit): 1 RGB pixel per 32-bit word → 5 words per 5-pixel row.
+// CI8 packed (64-bit): 8 CI8 pixels per 64-bit word → 1 word per 8-pixel row.
+// RGB24 unpacked (64-bit): 2 RGB pixels per 64-bit word → 3 words per 6-pixel row.
+// ============================================================================
+
+/// CI8 HOSTW 32-bit packed, multiline, multi-word-per-row.
+/// 8 pixels wide × 3 rows = 24 pixels. Packed CI8: 4 pixels per 32-bit word →
+/// 2 words per row, 6 words total.  Each row uses a different set of colors.
+#[test]
+fn test_hostw_ci8_multiline_32bit_packed() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Three rows of 8 unique CI8 colors each (MSB-first within each word).
+    let rows: [[u8; 8]; 3] = [
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34],
+        [0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x01, 0x23],
+    ];
+    let (x0, y0, x1, y1) = (0i32, 0i32, 7i32, 2i32); // 8×3
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK); // SET — loads draw mode
+
+    // Send 2 words per row, 3 rows = 6 words total.
+    // Packed CI8: word = (p0<<24)|(p1<<16)|(p2<<8)|p3, MSB is drawn first.
+    for row in &rows {
+        let w0: u32 = ((row[0] as u32) << 24) | ((row[1] as u32) << 16)
+                    | ((row[2] as u32) << 8)  |  (row[3] as u32);
+        let w1: u32 = ((row[4] as u32) << 24) | ((row[5] as u32) << 16)
+                    | ((row[6] as u32) << 8)  |  (row[7] as u32);
+        write_hostrw32(&rex, w0); // GO — draws pixels 0-3 of this row
+        write_hostrw32(&rex, w1); // GO — draws pixels 4-7, advances y
+    }
+    wait(&rex);
+
+    for (y, row) in rows.iter().enumerate() {
+        for (x, &expected) in row.iter().enumerate() {
+            let got = read_pixel(&rex, x as i32, y as i32) & 0xFF;
+            assert_eq!(got, expected as u32,
+                "CI8 HOSTW32 packed y={y} x={x}: got {got:#04x} expected {expected:#04x}");
+        }
+    }
+}
+
+/// RGB24 HOSTW 32-bit unpacked, multiline, multi-word-per-row.
+/// 5 pixels wide × 3 rows = 15 pixels. Unpacked RGB24: 1 pixel per 32-bit word →
+/// 5 words per row, 15 words total.
+#[test]
+fn test_hostw_rgb24_multiline_32bit_unpacked() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Three rows of 5 distinct RGB24 colors.
+    let rows: [[u32; 5]; 3] = [
+        [0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF],
+        [0x00FFFF, 0x804020, 0x102030, 0xABCDEF, 0x010203],
+        [0xFEDCBA, 0x123456, 0x789ABC, 0xDEF012, 0x345678],
+    ];
+    let (x0, y0, x1, y1) = (0i32, 0i32, 4i32, 2i32); // 5×3
+
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK); // SET
+
+    // 1 pixel per 32-bit GO write; REX advances x then y automatically.
+    for row in &rows {
+        for &px in row {
+            write_hostrw32(&rex, px);
+        }
+    }
+    wait(&rex);
+
+    for (y, row) in rows.iter().enumerate() {
+        for (x, &expected) in row.iter().enumerate() {
+            let got = read_pixel(&rex, x as i32, y as i32) & 0xFFFFFF;
+            assert_eq!(got, expected,
+                "RGB24 HOSTW32 unpacked y={y} x={x}: got {got:#08x} expected {expected:#08x}");
+        }
+    }
+}
+
+/// CI8 HOSTW 64-bit packed, multiline, one word per row.
+/// 8 pixels wide × 3 rows = 24 pixels. Packed CI8 + rwdouble: 8 CI8 pixels
+/// per 64-bit word → 1 word per row, 3 words total.
+#[test]
+fn test_hostw_ci8_multiline_64bit_packed() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let rows: [[u8; 8]; 3] = [
+        [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
+        [0x91, 0xA2, 0xB3, 0xC4, 0xD5, 0xE6, 0xF7, 0x08],
+        [0x19, 0x2A, 0x3B, 0x4C, 0x5D, 0x6E, 0x7F, 0x00],
+    ];
+    let (x0, y0, x1, y1) = (0i32, 0i32, 7i32, 2i32); // 8×3
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK); // SET
+
+    // 8 CI8 pixels per 64-bit word, MSB-first.
+    // Byte layout: bits[63:56]=p0, bits[55:48]=p1, ..., bits[7:0]=p7.
+    for row in &rows {
+        let w: u64 = (row[0] as u64) << 56 | (row[1] as u64) << 48
+                   | (row[2] as u64) << 40 | (row[3] as u64) << 32
+                   | (row[4] as u64) << 24 | (row[5] as u64) << 16
+                   | (row[6] as u64) <<  8 | (row[7] as u64);
+        write_hostrw64(&rex, w);
+    }
+    wait(&rex);
+
+    for (y, row) in rows.iter().enumerate() {
+        for (x, &expected) in row.iter().enumerate() {
+            let got = read_pixel(&rex, x as i32, y as i32) & 0xFF;
+            assert_eq!(got, expected as u32,
+                "CI8 HOSTW64 packed y={y} x={x}: got {got:#04x} expected {expected:#04x}");
+        }
+    }
+}
+
+/// RGB24 HOSTW 64-bit unpacked, multiline, multiple words per row.
+/// 6 pixels wide × 3 rows = 18 pixels. RGB24 + rwdouble: 2 pixels per 64-bit
+/// word (high 32 bits = first pixel) → 3 words per row, 9 words total.
+#[test]
+fn test_hostw_rgb24_multiline_64bit_unpacked() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // Three rows of 6 distinct RGB24 colors.
+    let rows: [[u32; 6]; 3] = [
+        [0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF],
+        [0x112233, 0x445566, 0x778899, 0xAABBCC, 0xDDEEFF, 0x010203],
+        [0xFEDCBA, 0x987654, 0x321098, 0xABCDEF, 0xFEDCBA, 0x654321],
+    ];
+    let (x0, y0, x1, y1) = (0i32, 0i32, 5i32, 2i32); // 6×3
+
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW64);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg(&rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK); // SET
+
+    // 2 pixels per 64-bit word: high 32 bits = first pixel, low 32 bits = second.
+    for row in &rows {
+        for pair in row.chunks(2) {
+            let w: u64 = ((pair[0] as u64) << 32) | (pair[1] as u64);
+            write_hostrw64(&rex, w);
+        }
+    }
+    wait(&rex);
+
+    for (y, row) in rows.iter().enumerate() {
+        for (x, &expected) in row.iter().enumerate() {
+            let got = read_pixel(&rex, x as i32, y as i32) & 0xFFFFFF;
+            assert_eq!(got, expected,
+                "RGB24 HOSTW64 unpacked y={y} x={x}: got {got:#08x} expected {expected:#08x}");
+        }
+    }
+}
+
+// ============================================================================
+// I_LINE tests
+// ============================================================================
+
+// DM0 for a full I_LINE draw (stoponx+stopony so the whole line runs in one GO).
+const DM0_DRAW_ILINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP | DM0_STOPONXY;
+// DM0 for I_LINE single-step mode (no stoponx/stopony — one pixel per GO).
+const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP;
+// DM0 for a full F_LINE draw — fractional-endpoint Bresenham correction.
+const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE | DM0_DOSETUP | DM0_STOPONXY;
+// DM0 for a full A_LINE draw — F_LINE plus AWEIGHT-LUT endpoint suppression (needs ENDPTFILTER, bit 22, set separately).
+// A_LINE tests are out of scope for this pass (see rules/testing/rex3-fline-fractional-bresenham.md) —
+// kept for a future session, not yet exercised by any test.
+#[allow(dead_code)]
+const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE | DM0_DOSETUP | DM0_STOPONXY;
+#[allow(dead_code)]
+const DM0_ENDPTFILTER: u32 = 1 << 22;
+
+/// Draw an I_LINE in CI8 and return the set of (x,y) pixels that were written with `color`.
+/// Clears a 256x256 region starting at `base` before drawing.
+fn draw_iline_pixels(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8, dm0: u32) -> Vec<(i32, i32)> {
+    // Clear a generous region around the line.
+    let bx = x0.min(x1) - 2;
+    let by = y0.min(y1) - 2;
+    let ex = x0.max(x1) + 2;
+    let ey = y0.max(y1) + 2;
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_COLORI, 0);
+    reg(rex, REX3_XYENDI,   xy(ex, ey));
+    reg(rex, REX3_XYSTARTI, xy(bx, by));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Draw the line.
+    reg(rex, REX3_COLORI, color as u32);
+    reg(rex, REX3_XYENDI,   xy(x1, y1));
+    reg(rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(rex, REX3_DRAWMODE0, dm0);
+
+    // Collect all written pixels in the bounding box.
+    let mut pts = Vec::new();
+    for y in by..=ey {
+        for x in bx..=ex {
+            if read_pixel(rex, x, y) & 0xFF == color as u32 {
+                pts.push((x, y));
+            }
+        }
+    }
+    pts
+}
+
+/// Same but drives one pixel per GO (iterate_one / single-step mode).
+fn draw_iline_step(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8) -> Vec<(i32, i32)> {
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let pixel_count = dx.max(dy) + 1;
+
+    let bx = x0.min(x1) - 2;
+    let by = y0.min(y1) - 2;
+    let ex = x0.max(x1) + 2;
+    let ey = y0.max(y1) + 2;
+
+    // Clear region.
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_COLORI, 0);
+    reg(rex, REX3_XYENDI,   xy(ex, ey));
+    reg(rex, REX3_XYSTARTI, xy(bx, by));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // First GO with DOSETUP to establish Bresenham state and draw pixel 0.
+    reg(rex, REX3_COLORI, color as u32);
+    reg(rex, REX3_XYENDI,   xy(x1, y1));
+    reg(rex, REX3_XYSTARTI, xy(x0, y0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_STEP);
+
+    // Subsequent GOs without DOSETUP — each draws one more pixel.
+    let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+    for _ in 1..pixel_count {
+        reg_go(rex, REX3_DRAWMODE0, dm0_cont);
+    }
+
+    let mut pts = Vec::new();
+    for y in by..=ey {
+        for x in bx..=ex {
+            if read_pixel(rex, x, y) & 0xFF == color as u32 {
+                pts.push((x, y));
+            }
+        }
+    }
+    pts
+}
+
+/// Reference F_LINE Bresenham in software — a mechanical transcription of
+/// `setup()` + `fline_apply_fract()` + the `bres_step!` macro from
+/// `draw_line_bresenham` (rex3.rs), NOT the simplified octant-agnostic form
+/// `bres_pixels()` uses. This is deliberately duplicated rather than calling
+/// the real implementation: a hand-transcribed oracle must fail if
+/// `fline_apply_fract`/`setup()` regress, which a shared-code oracle cannot
+/// detect (see `rules/` note on this — a call-through oracle would mask
+/// exactly the kind of regression this test exists to catch).
+///
+/// `x0_frac4`/`y0_frac4` are the *start* endpoint's fractional nibble
+/// (0-15, 1/16-pixel units) — the only fractional input `fline_apply_fract`
+/// consumes; the end endpoint is integer-only here, matching what the
+/// F_LINE hardware path actually uses (draw_aline's AWEIGHT lookup is the
+/// only consumer of the *end* endpoint's fraction, handled separately by
+/// `aline_endpoint_skip` below).
+fn fline_pixels(x0: i32, x0_frac4: i32, y0: i32, y0_frac4: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    // BRES table copied verbatim from draw_line_bresenham (rex3.rs):
+    // (incrx1, incrx2, incry1, incry2, y_major), indexed by octant.
+    #[rustfmt::skip]
+    const BRES: [(i32, i32, i32, i32, bool); 8] = [
+        ( 0,  1, -1, -1, true ),  // octant 0
+        ( 0,  1,  1,  1, true ),  // octant 1
+        ( 0, -1, -1, -1, true ),  // octant 2
+        ( 0, -1,  1,  1, true ),  // octant 3
+        ( 1,  1,  0, -1, false),  // octant 4
+        ( 1,  1,  0,  1, false),  // octant 5
+        (-1, -1,  0, -1, false),  // octant 6
+        (-1, -1,  0,  1, false),  // octant 7
+    ];
+
+    // 21.11 fixed-point endpoint values, matching how the register writes
+    // populate ctx.xstart/ystart/xend/yend.
+    let xstart = (x0 << 11) | (x0_frac4 << 7);
+    let ystart = (y0 << 11) | (y0_frac4 << 7);
+    let xend = x1 << 11;
+    let yend = y1 << 11;
+
+    // --- setup(): derive octant + initial incr1/incr2/d (rex3.rs:1390-1419) ---
+    let dx = xend - xstart;
+    let dy = yend - ystart;
+    let adx = dx.abs() >> 11;
+    let ady = dy.abs() >> 11;
+
+    let mut octant = 0u32;
+    if dy < 0 { octant |= 1 << 0; } // OCTANT_YDEC
+    if dx < 0 { octant |= 1 << 1; } // OCTANT_XDEC
+    if adx > ady { octant |= 1 << 2; } // OCTANT_XMAJOR
+
+    let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
+    let incr1 = 2 * minor;
+    let incr2 = 2 * (minor - major);
+    let mut d = incr1 - major;
+
+    let (incrx1, incrx2, incry1, incry2, y_major) = BRES[(octant & 7) as usize];
+
+    let mut x = xstart >> 11;
+    let mut y = ystart >> 11;
+    let x2 = xend >> 11;
+    let y2 = yend >> 11;
+
+    // --- fline_apply_fract() (rex3.rs:1754-1816), transcribed verbatim ---
+    {
+        let x1p = xstart >> 11;
+        let y1p = ystart >> 11;
+        let x2p = xend >> 11;
+        let y2p = yend >> 11;
+        let mut fdx = (x1p - x2p).abs();
+        let mut fdy = (y1p - y2p).abs();
+        let mut xf = (xstart >> 7) & 0xF;
+        let mut yf = (ystart >> 7) & 0xF;
+
+        match octant & 7 {
+            1 => {
+                std::mem::swap(&mut xf, &mut yf);
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            3 => {
+                xf = 0x10 - xf;
+                std::mem::swap(&mut xf, &mut yf);
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            7 => { xf = 0x10 - xf; }
+            6 => {
+                xf = 0x10 - xf;
+                yf = 0x10 - yf;
+            }
+            2 => {
+                let t = 0x10 - xf;
+                xf = 0x10 - yf;
+                yf = t;
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            0 => {
+                let t = 0x10 - yf;
+                yf = xf;
+                xf = t;
+                std::mem::swap(&mut fdx, &mut fdy);
+            }
+            4 => { yf = 0x10 - yf; }
+            _ => {}
+        }
+
+        // Spec-correct base d for F_LINE/A_LINE is 3*minor - 2*major, not
+        // I_LINE's 2*minor - major (see rex3.rs fline_apply_fract for the
+        // full derivation from rex3_pdf.md 3.6.1.2 and MAME's do_fline).
+        // `d` here still holds the I_LINE-formula value; apply the same
+        // (minor - major) correction the real fix applies before adding
+        // the fractional term.
+        d += fdy - fdx;
+        d += 2 * (((fdx * yf) >> 4) - ((fdy * xf) >> 4));
+        let major_delta = if y_major { fdy } else { fdx };
+        let e = d - 2 * major_delta;
+        if e > 0 {
+            d = e;
+            let x_major = !y_major;
+            if x_major {
+                y -= incry2;
+            } else {
+                x += incrx2;
+            }
+        }
+    }
+
+    // --- step exactly like bres_step! / draw_line_bresenham's main loop ---
+    let adx2 = (x2 - x).abs();
+    let ady2 = (y2 - y).abs();
+    let pixel_count = adx2.max(ady2) + 1;
+
+    let mut pts = Vec::new();
+    for i in 0..pixel_count {
+        pts.push((x, y));
+        let is_last = i == pixel_count - 1;
+        if !is_last {
+            if d < 0 {
+                x += incrx1; y -= incry1; d += incr1;
+            } else {
+                x += incrx2; y -= incry2; d += incr2;
+            }
+        }
+    }
+    pts
+}
+
+/// Reference A_LINE endpoint-suppression decision — mirrors `draw_aline`'s
+/// AWEIGHT LUT lookup (rex3.rs:1826-1851). `aweight0`/`aweight1` are the raw
+/// 16-entry/4-bit-packed LUT register values. Returns (skip_first, skip_last).
+/// A_LINE tests are out of scope for this pass — kept for a future session.
+#[allow(dead_code)]
+fn aline_endpoint_skip(
+    x0_frac4: i32, y0_frac4: i32, x1_frac4: i32, y1_frac4: i32,
+    aweight0: u32, aweight1: u32,
+) -> (bool, bool) {
+    let mut skip_first = false;
+    let mut skip_last = false;
+    if x0_frac4 != 0 || y0_frac4 != 0 {
+        let wi = ((x0_frac4 + y0_frac4) as usize).min(15);
+        let w = (aweight0 >> (wi * 4)) & 0xF;
+        if w == 0 { skip_first = true; }
+    }
+    if x1_frac4 != 0 || y1_frac4 != 0 {
+        let wi = ((x1_frac4 + y1_frac4) as usize).min(15);
+        let w = (aweight1 >> (wi * 4)) & 0xF;
+        if w == 0 { skip_last = true; }
+    }
+    (skip_first, skip_last)
+}
+
+/// Reference Bresenham in software — returns the exact pixel sequence for an integer line.
+fn bres_pixels(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    let mut pts = Vec::new();
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let sx = if x1 >= x0 { 1 } else { -1 };
+    let sy = if y1 >= y0 { 1 } else { -1 };
+    let mut x = x0;
+    let mut y = y0;
+    if dx >= dy {
+        let mut d = 2 * dy - dx;
+        for _ in 0..=dx {
+            pts.push((x, y));
+            if d >= 0 { y += sy; d -= 2 * dx; }
+            d += 2 * dy;
+            x += sx;
+        }
+    } else {
+        let mut d = 2 * dx - dy;
+        for _ in 0..=dy {
+            pts.push((x, y));
+            if d >= 0 { x += sx; d -= 2 * dy; }
+            d += 2 * dx;
+            y += sy;
+        }
+    }
+    pts
+}
+
+// --- Single pixel line ---
+
+#[test]
+fn test_iline_single_pixel() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let pts = draw_iline_pixels(&rex, 10, 10, 10, 10, 0xAB, DM0_DRAW_ILINE);
+    assert_eq!(pts, vec![(10, 10)], "single-pixel line should write exactly one pixel");
+}
+
+// --- Horizontal lines ---
+
+#[test]
+fn test_iline_horizontal_2px() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let pts = draw_iline_pixels(&rex, 10, 10, 11, 10, 0xAB, DM0_DRAW_ILINE);
+    assert_eq!(pts, vec![(10, 10), (11, 10)], "2-pixel horizontal line");
+}
+
+#[test]
+fn test_iline_horizontal_8px() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let pts = draw_iline_pixels(&rex, 10, 20, 17, 20, 0xCD, DM0_DRAW_ILINE);
+    let expected: Vec<_> = (10..=17).map(|x| (x, 20)).collect();
+    assert_eq!(pts, expected, "8-pixel horizontal line");
+}
+
+// --- Vertical lines ---
+
+#[test]
+fn test_iline_vertical_2px() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let pts = draw_iline_pixels(&rex, 20, 10, 20, 11, 0xAB, DM0_DRAW_ILINE);
+    assert_eq!(pts, vec![(20, 10), (20, 11)], "2-pixel vertical line");
+}
+
+#[test]
+fn test_iline_vertical_8px() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let pts = draw_iline_pixels(&rex, 20, 10, 20, 17, 0xCD, DM0_DRAW_ILINE);
+    let expected: Vec<_> = (10..=17).map(|y| (20, y)).collect();
+    assert_eq!(pts, expected, "8-pixel vertical line");
+}
+
+// --- skip_first / skip_last on horizontal line ---
+
+#[test]
+fn test_iline_skipfirst() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm0 = DM0_DRAW_ILINE | (1 << 10); // skipfirst
+    let pts = draw_iline_pixels(&rex, 10, 30, 14, 30, 0xEE, dm0);
+    // pixels 11..=14 should be drawn, pixel 10 skipped
+    let expected: Vec<_> = (11..=14).map(|x| (x, 30)).collect();
+    assert_eq!(pts, expected, "skip_first should omit first pixel");
+}
+
+#[test]
+fn test_iline_skiplast() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm0 = DM0_DRAW_ILINE | (1 << 11); // skiplast
+    let pts = draw_iline_pixels(&rex, 10, 30, 14, 30, 0xEE, dm0);
+    // pixels 10..=13 should be drawn, pixel 14 skipped
+    let expected: Vec<_> = (10..=13).map(|x| (x, 30)).collect();
+    assert_eq!(pts, expected, "skip_last should omit last pixel");
+}
+
+#[test]
+fn test_iline_skipfirst_skiplast() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm0 = DM0_DRAW_ILINE | (1 << 10) | (1 << 11); // skipfirst+skiplast
+    let pts = draw_iline_pixels(&rex, 10, 30, 14, 30, 0xEE, dm0);
+    // pixels 11..=13 only
+    let expected: Vec<_> = (11..=13).map(|x| (x, 30)).collect();
+    assert_eq!(pts, expected, "skip_first+skip_last should omit both endpoints");
+}
+
+#[test]
+fn test_iline_lspattern_stipple() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    // DRAW I_LINE with ENLSPATTERN; pattern has only MSB set.
+    let dm0 = DM0_DRAW_ILINE | (1 << 13); // enlspattern
+    let bx = 8i32;
+    let ex = 14i32;
+    let y = 40i32;
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI, xy(ex, y));
+    reg(&rex, REX3_XYSTARTI, xy(bx, y));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    reg(&rex, REX3_LSPATTERN, 0x8000_0000);
+    reg(&rex, REX3_LSMODE, 0); // length=17, repeat=1
+    reg(&rex, REX3_COLORI, 0xEE);
+    reg(&rex, REX3_XYENDI, xy(ex, y));
+    reg(&rex, REX3_XYSTARTI, xy(bx, y));
+    reg_go(&rex, REX3_DRAWMODE0, dm0);
+
+    let mut drawn = Vec::new();
+    for x in bx..=ex {
+        if read_pixel(&rex, x, y) & 0xFF == 0xEE {
+            drawn.push(x);
+        }
+    }
+    // MSB-only pattern: first pixel on, then off for the rest.
+    assert_eq!(drawn, vec![bx], "stippled I_LINE should draw only pattern-on pixels");
+}
+
+#[test]
+fn test_iline_lsadvlast_advances_on_last_pixel() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let y = 50i32;
+    let dm0 = DM0_DRAW_ILINE | (1 << 13) | (1 << 14); // enlspattern + lsadvlast
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI, xy(20, y));
+    reg(&rex, REX3_XYSTARTI, xy(8, y));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    reg(&rex, REX3_LSPATTERN, 0x8000_0000);
+    reg(&rex, REX3_LSMODE, 0);
+    // First segment: single pixel at x=8
+    reg(&rex, REX3_COLORI, 0xAA);
+    reg(&rex, REX3_XYENDI, xy(8, y));
+    reg(&rex, REX3_XYSTARTI, xy(8, y));
+    reg_go(&rex, REX3_DRAWMODE0, dm0);
+
+    // Second segment without DOSETUP: continue from x=8 (persisted xstart), pat_bit advanced.
+    let dm0_cont = dm0 & !(1 << 5); // clear dosetup
+    reg(&rex, REX3_COLORI, 0xBB);
+    reg(&rex, REX3_XYENDI, xy(10, y));
+    reg_go(&rex, REX3_DRAWMODE0, dm0_cont);
+
+    assert_eq!(read_pixel(&rex, 8, y) & 0xFF, 0xAA);
+    assert_eq!(read_pixel(&rex, 9, y) & 0xFF, 0, "stipple advanced past MSB — pixel 9 should be off");
+    assert_eq!(read_pixel(&rex, 10, y) & 0xFF, 0, "pixel 10 should be off");
+}
+
+// --- All octants, r=32 circle, full draw ---
+
+#[test]
+fn test_iline_all_octants_full() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let cx = 100i32;
+    let cy = 100i32;
+    let r = 32i32;
+    let pad = 4;
+
+    // Clear entire working area once.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI,   xy(cx + r + pad, cy + r + pad));
+    reg(&rex, REX3_XYSTARTI, xy(cx - r - pad, cy - r - pad));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    // Sample every 15 degrees to hit all 8 octants.
+    // Each line gets a unique color so stale pixels from other lines don't contaminate.
+    for (idx, deg) in (0..360usize).step_by(15).enumerate() {
+        let color = (idx + 1) as u8; // 1..24, never 0
+        let rad = (deg as f64).to_radians();
+        let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+        let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+
+        reg(&rex, REX3_COLORI, color as u32);
+        reg(&rex, REX3_XYENDI,   xy(x1, y1));
+        reg(&rex, REX3_XYSTARTI, xy(cx, cy));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_ILINE);
+
+        // Collect only this line's color in its bounding box.
+        let bx = cx.min(x1) - pad; let ex = cx.max(x1) + pad;
+        let by = cy.min(y1) - pad; let ey = cy.max(y1) + pad;
+        let mut pts: HashSet<(i32,i32)> = HashSet::new();
+        for y in by..=ey {
+            for x in bx..=ex {
+                if read_pixel(&rex, x, y) & 0xFF == color as u32 {
+                    pts.insert((x, y));
+                }
+            }
+        }
+        let expected: HashSet<(i32,i32)> = bres_pixels(cx, cy, x1, y1).into_iter().collect();
+
+        assert_eq!(pts, expected,
+            "octant test deg={deg}: ({cx},{cy})->({x1},{y1})");
+    }
+}
+
+// --- All octants, single-step (iterate_one) mode ---
+
+#[test]
+fn test_iline_all_octants_step() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let cx = 200i32;
+    let cy = 100i32;
+    let r = 32i32;
+    let pad = 4;
+
+    // Clear entire working area once.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI,   xy(cx + r + pad, cy + r + pad));
+    reg(&rex, REX3_XYSTARTI, xy(cx - r - pad, cy - r - pad));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    for (idx, deg) in (0..360usize).step_by(15).enumerate() {
+        let color = (idx + 1) as u8;
+        let rad = (deg as f64).to_radians();
+        let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+        let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+
+        let dx = (x1 - cx).abs();
+        let dy = (y1 - cy).abs();
+        let pixel_count = dx.max(dy) + 1;
+
+        // First GO with DOSETUP.
+        reg(&rex, REX3_COLORI, color as u32);
+        reg(&rex, REX3_XYENDI,   xy(x1, y1));
+        reg(&rex, REX3_XYSTARTI, xy(cx, cy));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_STEP);
+
+        // Subsequent GOs — one pixel each.
+        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+        for _ in 1..pixel_count {
+            reg_go(&rex, REX3_DRAWMODE0, dm0_cont);
+        }
+
+        let bx = cx.min(x1) - pad; let ex = cx.max(x1) + pad;
+        let by = cy.min(y1) - pad; let ey = cy.max(y1) + pad;
+        let mut pts: HashSet<(i32,i32)> = HashSet::new();
+        for y in by..=ey {
+            for x in bx..=ex {
+                if read_pixel(&rex, x, y) & 0xFF == color as u32 {
+                    pts.insert((x, y));
+                }
+            }
+        }
+        let expected: HashSet<(i32,i32)> = bres_pixels(cx, cy, x1, y1).into_iter().collect();
+
+        assert_eq!(pts, expected,
+            "step-mode octant deg={deg}: ({cx},{cy})->({x1},{y1}): got {:?} expected {:?}", pts, expected);
+    }
+}
+
+// ============================================================================
+// F_LINE tests — fractional-endpoint Bresenham correction
+// ============================================================================
+
+/// Same 24-direction, 15°-increment sweep as `test_iline_all_octants_full`,
+/// but the center (start endpoint) is shifted by exactly half a pixel via
+/// REX3_XSTARTF/YSTARTF, and results are checked against `fline_pixels()`
+/// (which applies the same fractional correction as `fline_apply_fract`)
+/// instead of `bres_pixels()`. This is the "multidirectional line with
+/// subpixel precision" test: it would degrade to the plain-integer oracle
+/// (and silently pass even with a broken fractional path) if the offset
+/// were zero — the half-pixel shift is what actually exercises
+/// `fline_apply_fract`'s octant-dependent xf/yf swap-and-mirror logic.
+#[test]
+fn test_fline_all_octants_half_pixel() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let cx = 100i32;
+    let cy = 100i32;
+    let cx_frac = 8; // 0.5px
+    let cy_frac = 8; // 0.5px
+    let r = 32i32;
+    let pad = 4;
+
+    // Clear entire working area once.
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI,   xy(cx + r + pad, cy + r + pad));
+    reg(&rex, REX3_XYSTARTI, xy(cx - r - pad, cy - r - pad));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    for (idx, deg) in (0..360usize).step_by(15).enumerate() {
+        let color = (idx + 1) as u8; // 1..24, never 0
+        let rad = (deg as f64).to_radians();
+        let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+        let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+
+        reg(&rex, REX3_COLORI, color as u32);
+        // End endpoint must go through the unbiased F-registers too — mixing
+        // a biased XYENDI with an unbiased XSTARTF corrupts dx/dy (see the
+        // doc comment on write_xstartf).
+        write_xendf(&rex, x1, 0);
+        write_yendf(&rex, y1, 0);
+        write_xstartf(&rex, cx, cx_frac);
+        write_ystartf(&rex, cy, cy_frac);
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+
+        let bx = cx.min(x1) - pad; let ex = cx.max(x1) + pad;
+        let by = cy.min(y1) - pad; let ey = cy.max(y1) + pad;
+        let mut pts: HashSet<(i32,i32)> = HashSet::new();
+        for y in by..=ey {
+            for x in bx..=ex {
+                if read_pixel(&rex, x, y) & 0xFF == color as u32 {
+                    pts.insert((x, y));
+                }
+            }
+        }
+        let expected: HashSet<(i32,i32)> =
+            fline_pixels(cx, cx_frac, cy, cy_frac, x1, y1).into_iter().collect();
+
+        assert_eq!(pts, expected,
+            "fline half-pixel octant test deg={deg}: ({cx}.5,{cy}.5)->({x1},{y1}): got {:?} expected {:?}",
+            pts, expected);
+    }
+}
+
+/// Same sweep, but at several distinct fractional offsets (1/4, 1/2, 3/4
+/// pixel) to confirm the fractional nibble is consumed proportionally
+/// (i.e. actually threaded through the xf/yf octant transform and the d
+/// correction term), not just treated as a single boolean "is fractional".
+#[test]
+fn test_fline_quarter_pixel_offsets() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    let cx = 150i32;
+    let cy = 150i32;
+    let r = 24i32;
+    let pad = 4;
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+    reg(&rex, REX3_COLORI, 0);
+    reg(&rex, REX3_XYENDI,   xy(cx + r + pad, cy + r + pad));
+    reg(&rex, REX3_XYSTARTI, xy(cx - r - pad, cy - r - pad));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    let mut color = 1u8;
+    for &frac4 in &[4i32, 8, 12] { // 0.25px, 0.5px, 0.75px
+        for &deg in &[0usize, 45, 90, 135, 180, 225, 270, 315] {
+            let rad = (deg as f64).to_radians();
+            let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+            let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+
+            reg(&rex, REX3_COLORI, color as u32);
+            write_xendf(&rex, x1, 0);
+            write_yendf(&rex, y1, 0);
+            write_xstartf(&rex, cx, frac4);
+            write_ystartf(&rex, cy, frac4);
+            reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+
+            let bx = cx.min(x1) - pad; let ex = cx.max(x1) + pad;
+            let by = cy.min(y1) - pad; let ey = cy.max(y1) + pad;
+            let mut pts: HashSet<(i32,i32)> = HashSet::new();
+            for y in by..=ey {
+                for x in bx..=ex {
+                    if read_pixel(&rex, x, y) & 0xFF == color as u32 {
+                        pts.insert((x, y));
+                    }
+                }
+            }
+            let expected: HashSet<(i32,i32)> =
+                fline_pixels(cx, frac4, cy, frac4, x1, y1).into_iter().collect();
+
+            assert_eq!(pts, expected,
+                "fline frac4={frac4} deg={deg}: ({cx}+{frac4}/16,{cy}+{frac4}/16)->({x1},{y1}): \
+                 got {:?} expected {:?}", pts, expected);
+
+            color = color.wrapping_add(1).max(1);
+        }
+    }
+}
+
+// A_LINE tests: out of scope for this pass — see rules/testing/rex3-fline-fractional-bresenham.md.
+// aline_endpoint_skip() (the AWEIGHT-LUT oracle helper) is kept for a future session.
+
+// ============================================================================
+// I_LINE line-loop test (XYSTARTI + repeated XYENDI GOs, SKIPLAST, DOSETUP)
+// ============================================================================
+
+/// Draw a 10×16 axis-aligned rectangle as a line loop using the IRIX cursor
+/// drawing pattern: one XYSTARTI write sets the start, then four XYENDI GOs
+/// complete the four sides.  SKIPLAST prevents overdrawing the shared vertex
+/// at each corner.  DOSETUP re-derives Bresenham on every GO from xstart.
+///
+/// Each side is drawn with a distinct CI8 color so we can verify:
+///   1. Every expected pixel on each side has the correct color.
+///   2. Corner pixels belong to exactly one side (no double-draw from skiplast).
+///   3. No "gap" at side starts (xstart not over-advanced from previous segment).
+///
+/// We test all four starting corners × clockwise + counter-clockwise = 8 rects.
+#[test]
+fn test_iline_line_loop_rect() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    // DM0: DRAW | I_LINE | DOSETUP | STOPONXY | SKIPLAST
+    let dm0_loop: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE
+        | DM0_DOSETUP | DM0_STOPONXY | (1 << 11); // bit11 = skiplast
+
+    reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(&rex, REX3_WRMASK, 0xFF);
+
+    // Rectangle dimensions (exclusive of endpoint — skiplast omits it).
+    // Width=10 (x: +9), Height=16 (y: +15).
+    let w = 9;  // dx to far corner
+    let h = 15; // dy to far corner
+
+    // Colors: top=1, right=2, bottom=3, left=4
+    let colors = [1u8, 2, 3, 4];
+
+    // (corner_x, corner_y, clockwise)
+    let cases: &[(i32, i32, bool)] = &[
+        (20, 30, true),   // top-left, CW
+        (20, 30, false),  // top-left, CCW
+        (80, 30, true),   // top-right, CW
+        (80, 30, false),  // top-right, CCW
+        (20, 80, true),   // bottom-left, CW
+        (20, 80, false),  // bottom-left, CCW
+        (80, 80, true),   // bottom-right, CW
+        (80, 80, false),  // bottom-right, CCW
+    ];
+
+    for &(ox, oy, cw) in cases {
+        // Four corners of the rectangle.
+        let tl = (ox,     oy);
+        let tr = (ox + w, oy);
+        let br = (ox + w, oy + h);
+        let bl = (ox,     oy + h);
+
+        // CW:  TL→TR→BR→BL→TL  (top, right, bottom, left)
+        // CCW: TL→BL→BR→TR→TL  (left, bottom, right, top)
+        let (p0, p1, p2, p3, p4) = if cw {
+            (tl, tr, br, bl, tl)
+        } else {
+            (tl, bl, br, tr, tl)
+        };
+        let sides = [
+            (p0, p1, colors[0]),
+            (p1, p2, colors[1]),
+            (p2, p3, colors[2]),
+            (p3, p4, colors[3]),
+        ];
+
+        // Clear the rect region.
+        reg(&rex, REX3_COLORI, 0);
+        reg(&rex, REX3_XYENDI,   xy(ox + w + 1, oy + h + 1));
+        reg(&rex, REX3_XYSTARTI, xy(ox - 1,     oy - 1));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        // XYSTARTI sets start position (no GO).
+        reg(&rex, REX3_COLORI, sides[0].2 as u32);
+        reg(&rex, REX3_XYENDI,   xy(sides[0].1.0, sides[0].1.1));
+        reg(&rex, REX3_XYSTARTI, xy(sides[0].0.0, sides[0].0.1));
+        reg_go(&rex, REX3_DRAWMODE0, dm0_loop);
+
+        // Remaining three sides — each XYENDI GO continues from current xstart.
+        for &(_, end, color) in &sides[1..] {
+            reg(&rex, REX3_COLORI, color as u32);
+            reg(&rex, REX3_XYENDI, xy(end.0, end.1));
+            reg_go(&rex, REX3_DRAWMODE0, dm0_loop);
+        }
+
+        // Verify each side.
+        for (si, &((x0, y0), (x1, y1), color)) in sides.iter().enumerate() {
+            // Expected pixels: bres_pixels from start to end, minus the endpoint
+            // (skiplast omits it — it's the startpoint of the next side).
+            let all = bres_pixels(x0, y0, x1, y1);
+            let expected_len = all.len() - 1; // skiplast drops endpoint
+            let expected: Vec<_> = all[..expected_len].to_vec();
+
+            for &(px, py) in &expected {
+                let got = read_pixel(&rex, px, py) & 0xFF;
+                assert_eq!(got, color as u32,
+                    "case ox={ox} oy={oy} cw={cw} side={si}: pixel ({px},{py}) \
+                     expected color {color} got {got}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// JIT correctness tests — compare interpreter vs JIT framebuffer output
+// ============================================================================
+//
+// Pattern: run the same draw via interpreter (no JIT), then via JIT (with JIT enabled,
+// wait for compile), then assert the framebuffers are identical.
+
+#[cfg(feature = "rex-jit")]
+mod jit_tests {
+    use super::*;
+    use crate::rex3_jit::RexJit;
+
+    /// Build a Rex3 with JIT enabled.
+    fn make_rex3_jit() -> &'static Rex3 {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let rex = Box::leak(Box::new(Rex3::new(
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                )));
+                unsafe {
+                    (*rex.fb_rgb.get()).fill(0);
+                    (*rex.fb_aux.get()).fill(0);
+                }
+                rex.rex_jit = Some(std::sync::Arc::new(RexJit::new()));
+                rex.start();
+                rex
+            })
+            .expect("make_rex3_jit thread panicked")
+            .join()
+            .expect("make_rex3_jit thread panicked")
+    }
+
+    /// Dump fb_rgb pixels in region (x0,y0)..(x1,y1) inclusive.
+    fn dump_region(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.push(read_pixel(rex, x, y));
+            }
+        }
+        out
+    }
+
+    /// Clear fb_rgb in region to 0.
+    fn clear_region(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32) {
+        unsafe {
+            let fb = &mut *rex.fb_rgb.get();
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = 0;
+                }
+            }
+        }
+        unsafe {
+            let fb = &mut *rex.fb_aux.get();
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = 0;
+                }
+            }
+        }
+    }
+
+    /// Core JIT vs interpreter comparison helper.
+    /// `setup` writes all registers except the final GO (which calls the draw).
+    /// `dm0` is written as the GO trigger. `dm1` is written by setup.
+    /// Returns (interp_pixels, jit_pixels) for the given region.
+    fn compare_jit_interp(
+        x0: i32, y0: i32, x1: i32, y1: i32,
+        setup: impl Fn(&Rex3),
+        dm0: u32, dm1: u32,
+    ) {
+        // Interpreter run (no JIT — rex_jit is None)
+        let rex_interp = make_rex3();
+        rex3init(rex_interp);
+        setup(rex_interp);
+        reg_go(rex_interp, REX3_DRAWMODE0, dm0);
+        let fb_interp = dump_region(rex_interp, x0, y0, x1, y1);
+
+        // JIT run
+        let rex_jit = make_rex3_jit();
+        rex3init(rex_jit);
+        setup(rex_jit);
+        // Drain GFIFO so ctx.clipmode is committed, then read clipmode_key.
+        wait(rex_jit);
+        let cm = {
+            use crate::rex3::CLIPMODE_JIT_KEY_MASK;
+            let ctx = unsafe { &*rex_jit.context.get() };
+            ctx.clipmode & CLIPMODE_JIT_KEY_MASK
+        };
+        // First GO: triggers compile + interpreter fallback
+        reg_go(rex_jit, REX3_DRAWMODE0, dm0);
+        // Wait for JIT compile
+        let compiled = if let Some(ref jit) = rex_jit.rex_jit {
+            jit.wait_compiled(dm0, dm1, cm)
+        } else { false };
+        assert!(compiled, "JIT compile failed for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}");
+
+        // Reset fb and re-run via JIT.
+        //
+        // The "trigger compile" GO above may have executed via the interpreter
+        // fallback (compilation happens asynchronously) and, for a dm0 without
+        // DOSETUP set, that draw would have advanced ctx.pat_bit/zpat_bit as a
+        // side effect (pattern bit position only resets on DOSETUP — see
+        // execute_go, rex3.rs). rex3init()/setup() only touch MMIO registers,
+        // and pat_bit/zpat_bit have no register mapping (pure internal state),
+        // so without this reset the comparison run below would start from
+        // whatever pattern position the first GO left behind instead of the
+        // fresh state rex_interp's single-GO run used — a test-harness bug
+        // that showed up as spurious JIT/interp pixel mismatches for any
+        // dm0 lacking DOSETUP (confirmed: jit_lspattern_span_rgb24 and
+        // friends all use continuation-style dm0 values with DOSETUP clear).
+        clear_region(rex_jit, x0, y0, x1, y1);
+        rex3init(rex_jit);
+        unsafe {
+            let ctx = &mut *rex_jit.context.get();
+            ctx.pat_bit = 0;
+            ctx.zpat_bit = 0;
+        }
+        setup(rex_jit);
+        reg_go(rex_jit, REX3_DRAWMODE0, dm0);
+        let fb_jit = dump_region(rex_jit, x0, y0, x1, y1);
+
+        assert_eq!(fb_interp, fb_jit,
+            "JIT/interp mismatch: dm0={dm0:#010x} dm1={dm1:#010x}");
+    }
+
+    /// RGB24 solid fill block — most common draw mode.
+    #[test]
+    fn jit_solid_fill_rgb24() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(10, 10, 25, 25,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_A0_50_80u32); // packed RGB24
+                reg(rex, REX3_XYENDI,    xy(25, 25));
+                reg(rex, REX3_XYSTARTI,  xy(10, 10));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// CI8 solid fill block — 8bpp palette mode.
+    #[test]
+    fn jit_solid_fill_ci8() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 15, 15,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFF);
+                reg(rex, REX3_COLORI,    0x42);
+                reg(rex, REX3_XYENDI,    xy(15, 15));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB24 XOR logic op block.
+    #[test]
+    fn jit_logicop_xor_rgb24() {
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_XOR;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 15, 15,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_FF_00_FFu32);
+                reg(rex, REX3_XYENDI,    xy(15, 15));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB24 fastclear block.
+    #[test]
+    fn jit_fastclear_rgb24() {
+        // fastclear = DM1 bit 17; cidmatch must be 0xF for fastclear to activate in interpreter
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_SRC | (1 << 17);
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 31, 31,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_COLORVRAM, 0xABCDEF);
+                // cidmatch must be 0xF (bits [12:9] of CLIPMODE) for fastclear to fire
+                reg(rex, REX3_CLIPMODE,  0xF << 9);
+                reg(rex, REX3_XYENDI,    xy(31, 31));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB24 solid fill span.
+    #[test]
+    fn jit_solid_fill_span_rgb24() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN;
+        compare_jit_interp(5, 5, 20, 5,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_12_34_56u32);
+                reg(rex, REX3_XYENDI,    xy(20, 5));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Gouraud shaded span — shade DDA path.
+    #[test]
+    fn jit_gouraud_shade_span() {
+        let dm1 = DM1_RGB24_SRC;
+        // DM0 with shade bit 18
+        let dm0 = DM0_DRAW_SPAN | (1 << 18);
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  10u32 << 11);   // start red=10
+                reg(rex, REX3_SLOPERED,  2u32 << 11);    // slope +2/pixel
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade span with skipfirst: first pixel is skipped but shade still steps,
+    /// so pixel 1 (the first drawn) has color = start + slope.
+    #[test]
+    fn jit_shade_span_skipfirst() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18) | (1 << 10); // shade + skipfirst
+        compare_jit_interp(0, 0, 7, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  20u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(7, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade span with skiplast: last pixel is skipped, all others drawn.
+    #[test]
+    fn jit_shade_span_skiplast() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18) | (1 << 11); // shade + skiplast
+        compare_jit_interp(0, 0, 7, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  5u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  4u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(7, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade span that saturates: color ramps up and clamps at 0xFF.
+    #[test]
+    fn jit_shade_span_saturate() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18); // shade
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  240u32 << 11); // start near max
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  10u32 << 11);  // large slope — wraps past 0xFF
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Z-pattern (stipple) block draw.
+    #[test]
+    fn jit_zpattern_block() {
+        let dm1 = DM1_RGB24_SRC;
+        // DM0 with enzpattern bit 12
+        let dm0 = DM0_DRAW_BLOCK | (1 << 12);
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_FF_80_40u32);
+                reg(rex, REX3_ZPATTERN,  0xAAAA_AAAA);  // alternating bits
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Gouraud shade block — 2D gradient.
+    #[test]
+    fn jit_gouraud_shade_block() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_BLOCK | (1 << 18); // shade bit
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0u32);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Line-stipple (enlspattern) span — the failing verifier case.
+    /// dm0=0x00022102: DRAW SPAN STOPONX ENLSPAT LSOPAQUE
+    /// dm1=0x3000f319: RGB 24bpp SRC
+    #[test]
+    fn jit_lspattern_span_rgb24() {
+        let dm0 = 0x00022102u32;
+        let dm1 = 0x3000f319u32;
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0xFF << 11);
+                reg(rex, REX3_LSPATTERN, 0xAAAA_AAAA); // alternating bits
+                // lsmode: lsrcount=0, lsrepeat=0, lsrcntsave=0, lslength=0 (length=17)
+                reg(rex, REX3_LSMODE,    0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade span with negative slope: color ramps down from high to zero and stays there.
+    #[test]
+    fn jit_shade_negative_slope() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18); // shade
+        // slope = -5 << 11; start at 200 so it hits 0 partway through
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  40u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                // negative slope: bit31=sign, lower bits = magnitude
+                reg(rex, REX3_SLOPERED,  0x8000_2800u32); // -5 << 11 = -0x2800
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade block with negative slopes on all three channels.
+    #[test]
+    fn jit_shade_negative_slope_block() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_BLOCK | (1 << 18); // shade
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0xC0u32 << 11);   // start at 192
+                reg(rex, REX3_COLORGRN,  0x80u32 << 11);   // start at 128
+                reg(rex, REX3_COLORBLUE, 0x40u32 << 11);   // start at 64
+                reg(rex, REX3_SLOPERED,  0x8000_3000u32);  // -6 << 11
+                reg(rex, REX3_SLOPEGRN,  0x8000_1800u32);  // -3 << 11
+                reg(rex, REX3_SLOPEBLUE, 0x8000_0800u32);  // -1 << 11
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB 12bpp + SHADE + DITHER block — exact octahedra screensaver draw modes.
+    /// dm0=0x002c0126: DRAW BLOCK DOSETUP STOPONX SHADE LRONLY CICLAMP
+    /// dm1=0x3009f011: RGB 12bpp host:12bpp logicop:SRC RGB DITHER
+    #[test]
+    fn jit_shade_rgb12_dither_block() {
+        let dm0 = 0x002c0126u32;
+        let dm1 = 0x3009f011u32;
+        compare_jit_interp(5, 5, 20, 5,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x40u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x20u32 << 11);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  2u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 1u32 << 11);
+                reg(rex, REX3_XYENDI,    xy(20, 5));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB 12bpp + SHADE + DITHER block, negative slopes — tests clamp-to-zero.
+    #[test]
+    fn jit_shade_rgb12_dither_negative() {
+        let dm0 = 0x002c0126u32;
+        let dm1 = 0x3009f011u32;
+        compare_jit_interp(5, 5, 20, 5,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0xA0u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x60u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x20u32 << 11);
+                reg(rex, REX3_SLOPERED,  0x8000_4000u32); // -8 << 11
+                reg(rex, REX3_SLOPEGRN,  0x8000_2000u32); // -4 << 11
+                reg(rex, REX3_SLOPEBLUE, 0x8000_1000u32); // -2 << 11
+                reg(rex, REX3_XYENDI,    xy(20, 5));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Exact triangle draw mode from simple GL test: ENZPAT + SHADE + LRONLY + CICLAMP + LEN32.
+    /// dm0=0x002c9126, dm1=0x3009f009 (RGB 8bpp dither SRC).
+    /// Uses zpattern=0xffffff00 (24 on, 8 off).
+    #[test]
+    fn jit_triangle_exact_mode() {
+        let dm0 = 0x002c9126u32;
+        let dm1 = 0x3009f009u32;
+        compare_jit_interp(0, 0, 32, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1,  dm1);
+                reg(rex, REX3_WRMASK,     0xFF);
+                reg(rex, REX3_ZPATTERN,   0xffffff00);
+                reg(rex, REX3_COLORRED,   0u32);
+                reg(rex, REX3_COLORGRN,   0u32);
+                reg(rex, REX3_COLORBLUE,  0x7fffff_u32); // near-max blue
+                reg(rex, REX3_SLOPERED,   2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE,  0x8000_0800u32); // -1<<11
+                reg(rex, REX3_XYSTARTI,   xy(0, 0));
+                reg(rex, REX3_XYENDI,     xy(32, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Multi-row block with STOPONY — tests that shade state persists correctly row-to-row.
+    /// dm0=0x002e0126: same as octa shade but with STOPONY added (bit 9).
+    #[test]
+    fn jit_shade_rgb12_dither_block_multirow() {
+        let dm0 = 0x002e0126u32; // DRAW BLOCK DOSETUP STOPONX STOPONY ENZPAT LRONLY CICLAMP SHADE
+        let dm1 = 0x3009f011u32;
+        compare_jit_interp(5, 5, 20, 10,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_ZPATTERN,  0xFFFFFFFF); // all-on, no masking
+                reg(rex, REX3_COLORRED,  0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x20u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x10u32 << 11);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  2u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 1u32 << 11);
+                reg(rex, REX3_XYENDI,    xy(20, 10));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// LRONLY block: pixels skipped when x_dec=1 (right-to-left), shade always advances.
+    /// Set x_dec=1 by making xend < xstart (decreasing x direction).
+    #[test]
+    fn jit_lronly_block_xdec() {
+        let dm0 = DM0_DRAW_BLOCK | (1 << 18) | (1 << 19); // shade + lronly
+        let dm1 = DM1_RGB24_SRC;
+        // x_dec=1: xstart > xend, octant has XDEC set by dosetup
+        // Use dosetup so octant is derived from coordinates
+        let dm0 = dm0 | (1 << 5); // dosetup
+        compare_jit_interp(0, 0, 15, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  5u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                // xstart > xend → x_dec direction
+                reg(rex, REX3_XYSTARTI,  xy(15, 0));
+                reg(rex, REX3_XYENDI,    xy(0, 7));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Exact menu text draw mode: DRAW BLOCK STOPONY ENLSPAT LSOPAQUE, RGB 8bpp.
+    /// lsopaque=1: pattern bit=0 → draw colorback; bit=1 → draw foreground color.
+    /// This is the most common draw in the popup menu (3416 uses).
+    #[test]
+    fn jit_lspattern_lsopaque_block_ci8() {
+        let dm0 = 0x00022106u32; // DRAW BLOCK STOPONY ENLSPAT LSOPAQUE
+        let dm1 = 0x30007109u32; // planes=RGB 8bpp SRC (CI mode)
+        compare_jit_interp(0, 0, 15, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFF);
+                reg(rex, REX3_COLORRED,  0x42u32 << 11); // foreground CI index
+                reg(rex, REX3_COLORBACK, 0x07u32);       // background CI index
+                reg(rex, REX3_LSPATTERN, 0xF0F0_F0F0u32); // alternating nibbles
+                reg(rex, REX3_LSMODE,    0);
+                reg(rex, REX3_CLIPMODE,  0xF << 9);      // cidmatch=0xF
+                reg(rex, REX3_XYENDI,    xy(15, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Timing comparison: full-screen Gouraud-shaded fill, interpreter vs JIT.
+    ///
+    /// Matches what IRIX actually does: one SPAN GO per scanline (STOPONX, no STOPONY),
+    /// color and XYSTARTI/XYENDI set per line, slope constant across the frame.
+    /// All scanlines are pushed into the GFIFO without waiting between them; a single
+    /// wait_idle() at the end drains the queue.  This measures pure shader throughput
+    /// rather than GFIFO round-trip latency.
+    ///
+    /// Not a correctness test — always passes — output visible with `--nocapture`.
+    #[test]
+    fn jit_timing_shade_scanlines_fullscreen() {
+        const ITERS: u32 = 20;
+        const W: i32     = 1279;
+        const H: i32     = 1023;
+
+        // SPAN, SHADE, STOPONX (no STOPONY — each GO is exactly one scanline)
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18); // shade, stoponx already in DM0_DRAW_SPAN
+
+        // Helper: push ITERS full screens as back-to-back scanline GOs, return elapsed nanos.
+        // dm1/wrmask/slopes are constant; only colorRGB and xystarti/xyendi change per line.
+        let run = |rex: &Rex3| -> u64 {
+            reg(rex, REX3_DRAWMODE1,  dm1);
+            reg(rex, REX3_WRMASK,     0xFFFFFF);
+            reg(rex, REX3_SLOPERED,   2u32 << 11);
+            reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+            reg(rex, REX3_SLOPEBLUE,  0);
+
+            let start = std::time::Instant::now();
+            for i in 0..ITERS {
+                let r0 = ((i * 7) % 200) as u32; // vary per frame to prevent dead-code elision
+                let g0 = ((i * 3) % 180) as u32;
+                let b0 = ((i * 5) % 160) as u32;
+                for y in 0..=H {
+                    reg(rex, REX3_COLORRED,   r0 << 11);
+                    reg(rex, REX3_COLORGRN,   g0 << 11);
+                    reg(rex, REX3_COLORBLUE,  b0 << 11);
+                    reg(rex, REX3_XYENDI,     xy(W, y));
+                    // XYSTARTI+GO in one write — triggers the draw
+                    rex.write32(go_addr(REX3_XYSTARTI), xy(0, y));
+                }
+                // Drain after each full frame so we measure throughput not queue depth
+                rex.wait_idle();
+            }
+            start.elapsed().as_nanos() as u64
+        };
+
+        // ── interpreter run ───────────────────────────────────────────────────
+        let rex_interp = make_rex3();
+        rex3init(rex_interp);
+        let interp_ns = run(rex_interp);
+
+        // ── JIT run: trigger compile on first scanline, wait, then run timed loop ──
+        let rex_jit = make_rex3_jit();
+        rex3init(rex_jit);
+        reg(rex_jit, REX3_DRAWMODE1,  dm1);
+        reg(rex_jit, REX3_WRMASK,     0xFFFFFF);
+        reg(rex_jit, REX3_SLOPERED,   2u32 << 11);
+        reg(rex_jit, REX3_SLOPEGRN,   1u32 << 11);
+        reg(rex_jit, REX3_SLOPEBLUE,  0);
+        reg(rex_jit, REX3_COLORRED,   0u32);
+        reg(rex_jit, REX3_COLORGRN,   0u32);
+        reg(rex_jit, REX3_COLORBLUE,  0u32);
+        reg(rex_jit, REX3_XYENDI,     xy(W, 0));
+        reg_go(rex_jit, REX3_XYSTARTI, xy(0, 0)); // triggers compile request
+        // Spin until compiled — re-request each iteration in case the channel was full
+        // (profile warm-up can fill the 256-entry sync_channel on first boot).
+        if let Some(ref jit) = rex_jit.rex_jit {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if jit.compiled_pairs().contains(&(dm0, dm1, 0)) { break; }
+                assert!(std::time::Instant::now() < deadline,
+                    "JIT compile timed out for dm0={dm0:#010x} dm1={dm1:#010x}");
+                jit.request_compile(dm0, dm1, 0); // retry if channel was full
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let jit_ns = run(rex_jit);
+
+        let px_per_iter   = (W as u64 + 1) * (H as u64 + 1);
+        let interp_mpx    = px_per_iter * ITERS as u64 * 1000 / interp_ns.max(1);
+        let jit_mpx       = px_per_iter * ITERS as u64 * 1000 / jit_ns.max(1);
+        let speedup_raw   = interp_ns as f64 / jit_ns.max(1) as f64;
+
+        println!(
+            "\n=== JIT timing: {} frames of {}×{} Gouraud-shade scanline fill ===\
+             \n  Interpreter : {:>8} ms  ({:>6} Mpx/s)\
+             \n  JIT         : {:>8} ms  ({:>6} Mpx/s)\
+             \n  Speedup     : {:.2}x (JIT is {})\n",
+            ITERS, W + 1, H + 1,
+            interp_ns / 1_000_000, interp_mpx,
+            jit_ns    / 1_000_000, jit_mpx,
+            speedup_raw.max(1.0 / speedup_raw.max(f64::EPSILON)),
+            if speedup_raw >= 1.0 { "faster" } else { "slower" },
+        );
+    }
+
+    /// Verify Gouraud interpolation pixel-by-pixel: R ramps from 255 down to 0 across 256 pixels.
+    ///
+    /// slope = (0 - 255) / 255 = -1 per pixel = -1 << 11 in o12.11 fixed-point.
+    /// colorred_start = 255 << 11.
+    /// Expected fb[x] red channel = 255 - x  for x in 0..=255, then 0 for x > 255.
+    ///
+    /// Tests both interpreter and JIT paths and prints pixel values on mismatch.
+    #[test]
+    fn jit_shade_ramp_255_to_0() {
+        // dm0: DRAW SPAN STOPONX SHADE
+        let dm0 = DM0_DRAW_SPAN | (1 << 18);
+        let dm1 = DM1_RGB24_SRC;
+
+        // slope = -1 per pixel = -1 in integer part = -1 << 11 in o12.11
+        // from_slope_red: negative slope written as 0x80000000 | magnitude
+        // magnitude of -1<<11 = 2048 = 0x800
+        let slope_neg1: u32 = 0x8000_0800; // -1 << 11
+
+        let check = |rex: &Rex3, label: &str| {
+            reg(rex, REX3_DRAWMODE0,  dm0);
+            reg(rex, REX3_DRAWMODE1,  dm1);
+            reg(rex, REX3_WRMASK,     0xFFFFFF);
+            reg(rex, REX3_COLORRED,   255u32 << 11);
+            reg(rex, REX3_COLORGRN,   0u32);
+            reg(rex, REX3_COLORBLUE,  0u32);
+            reg(rex, REX3_SLOPERED,   slope_neg1);
+            reg(rex, REX3_SLOPEGRN,   0);
+            reg(rex, REX3_SLOPEBLUE,  0);
+            reg(rex, REX3_XYENDI,     xy(255, 0));
+            reg_go(rex, REX3_XYSTARTI, xy(0, 0));
+
+            let mut failed = false;
+            for x in 0..=255i32 {
+                let px   = read_pixel(rex, x, 0);
+                let r    = px & 0xFF;
+                let expected = (255 - x) as u32;
+                if r != expected {
+                    if !failed {
+                        println!("{label}: ramp mismatch (first 8 errors):");
+                        failed = true;
+                    }
+                    println!("  x={x:3}: got r={r:#04x} ({r}), expected {expected:#04x} ({expected})");
+                }
+            }
+            assert!(!failed, "{label}: ramp 255→0 failed");
+        };
+
+        // Interpreter
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        check(rex_i, "interp");
+
+        // JIT
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        // First draw triggers compile + interp fallback; wait then re-draw
+        reg(rex_j, REX3_DRAWMODE0,  dm0);
+        reg(rex_j, REX3_DRAWMODE1,  dm1);
+        reg(rex_j, REX3_WRMASK,     0xFFFFFF);
+        reg(rex_j, REX3_COLORRED,   255u32 << 11);
+        reg(rex_j, REX3_COLORGRN,   0u32);
+        reg(rex_j, REX3_COLORBLUE,  0u32);
+        reg(rex_j, REX3_SLOPERED,   slope_neg1);
+        reg(rex_j, REX3_SLOPEGRN,   0);
+        reg(rex_j, REX3_SLOPEBLUE,  0);
+        reg(rex_j, REX3_XYENDI,     xy(255, 0));
+        reg_go(rex_j, REX3_XYSTARTI, xy(0, 0));
+        if let Some(ref jit) = rex_j.rex_jit {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if jit.compiled_pairs().contains(&(dm0, dm1, 0)) { break; }
+                assert!(std::time::Instant::now() < deadline, "JIT compile timeout");
+                jit.request_compile(dm0, dm1, 0);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        // Clear and re-run via JIT
+        for x in 0..=255i32 { unsafe { (*rex_j.fb_rgb.get())[(x as u32) as usize] = 0; } }
+        check(rex_j, "jit");
+    }
+
+    /// Exact octahedra blur mode: SPAN + SHADE + ENZPAT + DITHER + RGB12 + LEN32 + STOPONX + DOSETUP.
+    /// zpattern = 0x88888888 (every 4th pixel). Tests that zpat_bit resets to 31 each GO.
+    #[test]
+    fn jit_shade_enzpat_span_rgb12_dither() {
+        let dm0 = 0x00049122u32; // DRAW SPAN DOSETUP STOPONX ENZPAT LEN32 SHADE
+        let dm1 = 0x3009f011u32; // RGB 12bpp dither SRC
+        compare_jit_interp(0, 0, 40, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1,  dm1);
+                reg(rex, REX3_WRMASK,     0xFFFFFF);
+                reg(rex, REX3_ZPATTERN,   0x88888888);
+                reg(rex, REX3_COLORRED,   0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,   0x20u32 << 11);
+                reg(rex, REX3_COLORBLUE,  0x10u32 << 11);
+                reg(rex, REX3_SLOPERED,   2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE,  0u32);
+                reg(rex, REX3_XYSTARTI,   xy(0, 0));
+                reg(rex, REX3_XYENDI,     xy(40, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Same as above but DBLSRC variant (dm1=0x3009f031).
+    #[test]
+    fn jit_shade_enzpat_span_rgb12_dblsrc() {
+        let dm0 = 0x00049122u32;
+        let dm1 = 0x3009f031u32; // same + DBLSRC
+        compare_jit_interp(0, 0, 40, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1,  dm1);
+                reg(rex, REX3_WRMASK,     0xFFFFFF);
+                reg(rex, REX3_ZPATTERN,   0x88888888);
+                reg(rex, REX3_COLORRED,   0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,   0x20u32 << 11);
+                reg(rex, REX3_COLORBLUE,  0x10u32 << 11);
+                reg(rex, REX3_SLOPERED,   2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE,  0u32);
+                reg(rex, REX3_XYSTARTI,   xy(0, 0));
+                reg(rex, REX3_XYENDI,     xy(40, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// SCR2SCR block copy (CI8): mirrors test_ng1_scrtoscr.
+    /// Source at (0,0)..(7,7) painted 0xCC; copied to (16,0)..(23,7) via XYMOVE=(16,0).
+    #[test]
+    fn jit_scr2scr_ci8_block() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_SCR2SCR;
+        compare_jit_interp(16, 0, 23, 7,
+            |rex| {
+                // Paint source region
+                reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0xCC);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+                reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+                // Set up SCR2SCR registers
+                reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_XYMOVE,   (16u32 << 16) | 0);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE CI8 solid line — covers the basic Bresenham loop.
+    #[test]
+    fn jit_iline_ci8_solid() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_ILINE;
+        // Diagonal line (0,0)..(15,10) — exercises all octant paths collectively.
+        compare_jit_interp(0, 0, 17, 12,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0x77);
+                reg(rex, REX3_XYENDI,   xy(15, 10));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE RGB24 solid line — gently sloped, x-major.
+    #[test]
+    fn jit_iline_rgb24_solid() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_ILINE;
+        compare_jit_interp(0, 0, 22, 8,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_COLORRED, 0xFF << 11);
+                reg(rex, REX3_COLORGRN, 0x80 << 11);
+                reg(rex, REX3_COLORBLUE, 0x40 << 11);
+                reg(rex, REX3_XYENDI,   xy(20, 7));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE with SKIPFIRST and SKIPLAST — edge skip flags.
+    #[test]
+    fn jit_iline_skipfirst_skiplast() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_ILINE | (1 << 10) | (1 << 11); // SKIPFIRST | SKIPLAST
+        compare_jit_interp(0, 0, 14, 6,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0xAA);
+                reg(rex, REX3_XYENDI,   xy(12, 5));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE step mode (iterate_one): one pixel per GO, driven via compare_jit_interp
+    /// using the continuation dm0 (no DOSETUP, no STOPONXY).
+    #[test]
+    fn jit_iline_step_mode() {
+        let dm1 = DM1_CI8_SRC;
+        // step mode dm0: same adrmode but no stoponx/stopony/dosetup
+        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+        // We compare a single continuation step (after DOSETUP already set up Bresenham state).
+        // Setup: issue the DOSETUP GO first (interpreter-only, not JIT), then compare one step.
+        compare_jit_interp(0, 0, 14, 8,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0x55);
+                reg(rex, REX3_XYENDI,   xy(12, 6));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                // First GO with DOSETUP to establish Bresenham state
+                reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_STEP);
+                // Clear the starting pixel so we only compare the stepped pixels
+                // (subsequent GOs with dm0_cont drive the comparison)
+            },
+            dm0_cont, dm1,
+        );
+    }
+
+    /// I_LINE with Gouraud shading (shade DDA active on a line).
+    #[test]
+    fn jit_iline_shade() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_ILINE | (1 << 18); // SHADE bit
+        compare_jit_interp(0, 0, 16, 6,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                // Start color
+                reg(rex, REX3_COLORRED,  0xFF << 11);
+                reg(rex, REX3_COLORGRN,  0x00 << 11);
+                reg(rex, REX3_COLORBLUE, 0x80 << 11);
+                // Shade slopes (one step per pixel along the line major axis)
+                reg(rex, REX3_SLOPERED,  ((-8i32) as u32) << 11);
+                reg(rex, REX3_SLOPEGRN,  (8u32) << 11);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,   xy(14, 4));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// F_LINE with a fractional (half-pixel) start endpoint. Exercises the
+    /// same fractional-endpoint Bresenham correction (fline_apply_fract) as
+    /// the interpreter-only test_fline_all_octants_half_pixel, but now
+    /// through the JIT compile path — this is the parity check that would
+    /// have caught the JIT's silent I_LINE-degradation bug for F_LINE before
+    /// emit_draw_iline gained real fractional support.
+    #[test]
+    fn jit_fline_half_pixel_octants() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_FLINE;
+        // One representative direction per octant (8 of the 24-direction sweep
+        // used by the interpreter-only test) — full 24x would mean 24 separate
+        // JIT compiles, expensive for a parity check that just needs octant coverage.
+        // Deliberately ASYMMETRIC fractional offsets (xf != yf) at non-45-degree
+        // angles for most cases: a symmetric xf==yf offset at an exact 45-degree
+        // multiple is a degenerate geometry where the fractional correction term
+        // algebraically cancels against the plain I_LINE d — such cases pass even
+        // when the correction is missing entirely, so they can't catch a JIT
+        // regression on their own (this bit a first draft of this test).
+        let cx = 100i32;
+        let cy = 100i32;
+        let r = 24i32;
+        for (deg, xf, yf) in [
+            (0, 3, 11), (45, 5, 2), (90, 12, 7), (135, 1, 9),
+            (180, 8, 8), (225, 14, 3), (270, 6, 13), (315, 10, 1),
+        ] {
+            let rad = (deg as f64).to_radians();
+            let x1 = cx + (r as f64 * rad.cos()).round() as i32;
+            let y1 = cy + (r as f64 * rad.sin()).round() as i32;
+            compare_jit_interp(
+                cx.min(x1) - 4, cy.min(y1) - 4, cx.max(x1) + 4, cy.max(y1) + 4,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,   0xFF);
+                    reg(rex, REX3_COLORI,   0x99);
+                    write_xendf(rex, x1, 0);
+                    write_yendf(rex, y1, 0);
+                    write_xstartf(rex, cx, xf);
+                    write_ystartf(rex, cy, yf);
+                },
+                dm0, dm1,
+            );
+        }
+    }
+
+    /// SCR2SCR block copy (RGB24): copy a colored rectangle.
+    #[test]
+    fn jit_scr2scr_rgb24_block() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_SCR2SCR;
+        compare_jit_interp(20, 0, 27, 7,
+            |rex| {
+                // Paint source region in RGB24
+                reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_COLORRED, 0xAA << 11);
+                reg(rex, REX3_COLORGRN, 0x55 << 11);
+                reg(rex, REX3_COLORBLUE, 0x11 << 11);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+                reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+                // Set up SCR2SCR registers (xymove shifts dst by +20,0)
+                reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_XYMOVE,   (20u32 << 16) | 0);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 7));
+            },
+            dm0, dm1,
+        );
+    }
+
+    // ── HOSTRW JIT tests ──────────────────────────────────────────────────────
+    //
+    // For HOSTRW, compare_jit_interp can't be used directly since the GO trigger
+    // is a write to HOSTRW0 rather than DRAWMODE0.  Each test runs the same HOSTRW
+    // sequence on both an interpreter-only instance and a JIT instance, then compares
+    // the resulting framebuffer region.
+    //
+    // Pattern:
+    //   1. Set up both instances identically (DM1, WRMASK, coords, DM0 in SET space).
+    //   2. Run the HOSTRW GO sequence on the interpreter instance.
+    //   3. On the JIT instance: trigger compile with one GO, wait for compile, reset fb,
+    //      then replay the full GO sequence via JIT.
+    //   4. Compare framebuffer regions.
+
+    /// CI8 HOSTW 32-bit packed: 4 CI8 pixels per 32-bit word.
+    /// Mirrors test_hostw_ci8_write_block_32bit.
+    #[test]
+    fn jit_hostw_ci8_block_32bit() {
+        let dm0 = DM0_HOSTW_BLOCK;
+        let dm1 = DM1_CI8_HOSTRW;
+        let word: u32 = (0x11u32 << 24) | (0x22 << 16) | (0x33 << 8) | 0x44;
+
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFF);
+            reg(rex, REX3_XYENDI,    xy(3, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, dm0); // SET — no draw yet
+        };
+
+        // Interpreter run
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        write_hostrw32(rex_i, word);
+        wait(rex_i);
+        let fb_interp: Vec<u32> = (0..4).map(|x| read_pixel(rex_i, x, 0) & 0xFF).collect();
+
+        // JIT run: trigger compile, wait, replay
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw32(rex_j, word); // triggers compile request
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1, 0),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        // Reset and replay via JIT
+        clear_region(rex_j, 0, 0, 3, 0);
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw32(rex_j, word);
+        wait(rex_j);
+        let fb_jit: Vec<u32> = (0..4).map(|x| read_pixel(rex_j, x, 0) & 0xFF).collect();
+
+        assert_eq!(fb_interp, fb_jit,
+            "CI8 HOSTW JIT/interp mismatch: interp={fb_interp:?} jit={fb_jit:?}");
+    }
+
+    /// RGB24 HOSTW 32-bit: 1 pixel per word (non-packed, hostdepth=3).
+    /// Mirrors test_hostw_rgb24_write_block_32bit.
+    #[test]
+    fn jit_hostw_rgb24_block_32bit() {
+        let dm0 = DM0_HOSTW_BLOCK;
+        let dm1 = DM1_RGB24_HOSTRW;
+        let pixels: &[u32] = &[0x0000FF, 0x00FF00, 0xFF0000, 0xAABBCC];
+
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(3, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        };
+
+        // Interpreter run
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        for &p in pixels { write_hostrw32(rex_i, p); }
+        wait(rex_i);
+        let fb_interp: Vec<u32> = (0..4).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
+
+        // JIT run
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw32(rex_j, pixels[0]); // trigger compile
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1, 0),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        clear_region(rex_j, 0, 0, 3, 0);
+        rex3init(rex_j);
+        setup(rex_j);
+        for &p in pixels { write_hostrw32(rex_j, p); }
+        wait(rex_j);
+        let fb_jit: Vec<u32> = (0..4).map(|x| read_pixel(rex_j, x, 0) & 0xFFFFFF).collect();
+
+        assert_eq!(fb_interp, fb_jit,
+            "RGB24 HOSTW JIT/interp mismatch: interp={fb_interp:?} jit={fb_jit:?}");
+    }
+
+    /// RGB24 HOSTW 64-bit: 2 pixels per 64-bit word.
+    /// Mirrors test_hostw_rgb24_write_block_64bit.
+    #[test]
+    fn jit_hostw_rgb24_block_64bit() {
+        let dm0 = DM0_HOSTW_BLOCK;
+        let dm1 = DM1_RGB24_HOSTRW64;
+        let p0: u32 = 0x00FF0000;
+        let p1: u32 = 0x0000FF00;
+        let word64: u64 = ((p0 as u64) << 32) | (p1 as u64);
+
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(1, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        write_hostrw64(rex_i, word64);
+        wait(rex_i);
+        let fb_interp: Vec<u32> = (0..2).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw64(rex_j, word64);
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1, 0),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        clear_region(rex_j, 0, 0, 1, 0);
+        rex3init(rex_j);
+        setup(rex_j);
+        write_hostrw64(rex_j, word64);
+        wait(rex_j);
+        let fb_jit: Vec<u32> = (0..2).map(|x| read_pixel(rex_j, x, 0) & 0xFFFFFF).collect();
+
+        assert_eq!(fb_interp, fb_jit,
+            "RGB24 HOSTW64 JIT/interp mismatch: interp={fb_interp:?} jit={fb_jit:?}");
+    }
+
+    /// CI8 HOSTR 32-bit: read 4 CI8 pixels from framebuffer into one word.
+    /// Mirrors test_hostr_ci8_read_block_32bit.
+    #[test]
+    fn jit_hostr_ci8_block_32bit() {
+        // DM0 for READ
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+        let dm1 = DM1_CI8_HOSTRW;
+
+        // Fill 4 pixels with known CI8 values using interpreter
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        reg(fill_rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(fill_rex, REX3_WRMASK, 0xFF);
+        let pixels_in = [0x11u32, 0x22, 0x33, 0x44];
+        for (x, &v) in pixels_in.iter().enumerate() {
+            reg(fill_rex, REX3_COLORI,    v);
+            reg(fill_rex, REX3_XYSTARTI,  xy(x as i32, 0));
+            reg_go(fill_rex, REX3_XYENDI, xy(x as i32, 0));
+        }
+
+        let setup_read = |rex: &Rex3| {
+            // Copy framebuffer from fill_rex
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                dst[0..4].copy_from_slice(&src[0..4]);
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFF);
+            reg(rex, REX3_XYENDI,    xy(3, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+        };
+
+        // Interpreter HOSTR read
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        reg_go(rex_i, REX3_DRAWMODE0, dm0_read); // triggers first batch
+        let word_interp = read_hostrw32_last(rex_i);
+
+        // JIT HOSTR read
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        reg_go(rex_j, REX3_DRAWMODE0, dm0_read); // triggers compile + first batch
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        // Re-run via JIT
+        rex3init(rex_j);
+        setup_read(rex_j);
+        reg_go(rex_j, REX3_DRAWMODE0, dm0_read);
+        let word_jit = read_hostrw32_last(rex_j);
+
+        assert_eq!(word_interp, word_jit,
+            "CI8 HOSTR JIT/interp mismatch: interp={word_interp:#010x} jit={word_jit:#010x}");
+    }
+
+    /// RGB24 HOSTR 32-bit: read 1 RGB24 pixel per word, multiple words.
+    /// Mirrors test_hostr_rgb24_read_block_32bit.
+    #[test]
+    fn jit_hostr_rgb24_block_32bit() {
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+        let dm1 = DM1_RGB24_HOSTRW;
+        let pixels_in: &[u32] = &[0x112233, 0x445566, 0x778899, 0xAABBCC];
+        let width = pixels_in.len() as i32;
+
+        // Fill pixels
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        reg(fill_rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(fill_rex, REX3_WRMASK, 0xFFFFFF);
+        for (x, &v) in pixels_in.iter().enumerate() {
+            reg(fill_rex, REX3_COLORRED,  v << 11 & !0x7FF | v >> 11 & 0x7FF); // use raw color
+        }
+        // Simpler: write fb_rgb directly
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for (x, &v) in pixels_in.iter().enumerate() { fb[x] = v; }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                dst[..width as usize].copy_from_slice(&src[..width as usize]);
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(width - 1, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+        };
+
+        let read_words = |rex: &Rex3| -> Vec<u32> {
+            setup_read(rex);
+            reg_go(rex, REX3_DRAWMODE0, dm0_read);
+            let mut words = Vec::new();
+            for i in 0..width {
+                let w = if i < width - 1 { read_hostrw32(rex) } else { read_hostrw32_last(rex) };
+                words.push(w);
+            }
+            words
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        let words_interp = read_words(rex_i);
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        // Trigger compile
+        setup_read(rex_j);
+        reg_go(rex_j, REX3_DRAWMODE0, dm0_read);
+        read_hostrw32_last(rex_j); // drain
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        let words_jit = read_words(rex_j);
+
+        assert_eq!(words_interp, words_jit,
+            "RGB24 HOSTR JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    /// Multi-row HOSTR block with STOPONY *not* set — mirrors the real cursor
+    /// save/restore blit (IRIX login-screen text cursor): each row is its own
+    /// one-row primitive (no hardware row auto-advance), width wider than one
+    /// packed host word so each row takes 2 GOs, and — critically — the shader
+    /// compiles (interpreter fallback) partway through the sequence so later
+    /// rows dispatch via the freshly-compiled JIT entry while earlier rows ran
+    /// on the interpreter, exactly like the real async-compile timing.
+    ///
+    /// All existing jit_hostr_*/jit_hostw_* tests use DM0_STOPONXY (single GO,
+    /// full block in one shot) and never exercise this multi-GO, multi-row,
+    /// no-STOPONY shape — the gap that let this bug ship.
+    #[test]
+    fn jit_hostr_ci8_block_multirow_no_stopony() {
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_COLORHOST;
+        let dm1 = DM1_CI8_HOSTRW; // 8bpp packed, 4 pixels/word
+        let width = 6i32;  // 2 words/row (ceil(6/4))
+        let height = 3i32;
+        let words_per_row = 2usize;
+
+        // Fill a width x height region with distinct per-pixel values so any
+        // word/row misalignment shows up as a mismatch rather than coincidentally
+        // matching (e.g. an all-same-value fill would hide an off-by-one).
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for y in 0..height {
+                for x in 0..width {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = (0x10 + y * width + x) as u32;
+                }
+            }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                for y in 0..height {
+                    for x in 0..width {
+                        let idx = (y as u32 * 2048 + x as u32) as usize;
+                        dst[idx] = src[idx];
+                    }
+                }
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFF);
+        };
+
+        // Drive the exact GO sequence a row-at-a-time cursor blit uses: fresh
+        // XYSTARTI/XYENDI per row, DRAWMODE0 GO (no DOSETUP, no STOPONY) starts
+        // the row, then (words_per_row - 1) HOSTRW0 GO-space reads drain the
+        // rest of that row's words. ystart/xsave carry over via ctx state
+        // exactly as on real hardware — only the first row's registers are
+        // (re)written here since that's all the real driver does too (see
+        // rex3.log capture: XYSTARTI/XYENDI written once, then 40 bare GOs).
+        let read_all_words = |rex: &Rex3| -> Vec<u32> {
+            let mut words = Vec::new();
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+            reg(rex, REX3_XYENDI,   xy(width - 1, 0));
+            reg_go(rex, REX3_DRAWMODE0, dm0_read);
+            words.push(read_hostrw32_last(rex));
+            let total_words = words_per_row * height as usize;
+            for _ in 1..total_words {
+                words.push(read_hostrw32(rex));
+            }
+            words
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        let words_interp = read_all_words(rex_i);
+
+        // JIT run: prime compilation with a throwaway pass over the same
+        // primitive shape first (separate region so it doesn't consume any
+        // of the words compared below), wait for it to land, then run the
+        // real comparison pass. Because compilation is requested from
+        // whatever GO first sees this (dm0, dm1, cm) key and happens on a
+        // background thread, the *real* emulator can and does have a
+        // primitive's later rows dispatch via JIT after its earlier rows
+        // already ran on the interpreter — this priming pass reproduces that
+        // "already compiled by the time the real primitive runs" end state
+        // without relying on racy mid-primitive timing.
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let _ = read_all_words(rex_j); // throwaway: triggers compile request
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let words_jit = read_all_words(rex_j);
+
+        assert_eq!(words_interp, words_jit,
+            "CI8 HOSTR multirow (no STOPONY) JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    /// Stress test: large multi-row, multi-word-per-row HOSTR block readbacks with
+    /// STOPONXY set (DM0_READ_BLOCK's real shape — each row wraps mid-primitive
+    /// while more rows remain), comparing interpreter vs pre-warmed JIT output.
+    ///
+    /// Guards against a real bug (row-wrap-under-STOPONY: the JIT shader's
+    /// host_xstop_v word-boundary threshold is computed once at shader entry and
+    /// goes stale across an internal row wrap, so a JIT-compiled READ_BLOCK could
+    /// silently skip a host-word writeback right after wrapping to a new row).
+    /// jit_hostr_ci8_block_multirow_no_stopony above covers the same row-wrap
+    /// shape but without STOPONY, so it never touched this path — this test uses
+    /// DM0_READ_BLOCK (STOPONXY | COLORHOST | DOSETUP) like the real driver and
+    /// test_hostr_ci8_read_block_32bit do, at larger sizes with several rows and
+    /// several words per row so more than one row-wrap is exercised.
+    fn hostr_stress(dm1: u32, width: i32, height: i32, words_per_pixel_row: u32) {
+        // Distinct per-pixel values (not a solid fill) so any word/row
+        // misalignment shows up as a mismatch instead of coincidentally matching.
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for y in 0..height {
+                for x in 0..width {
+                    // Every pixel must stay distinct even after each plane's own
+                    // depth mask (CI8 keeps only the low byte) — vary the low byte
+                    // directly instead of only the high bits, or a CI8 readback
+                    // would see an accidentally-solid fill and hide misalignment.
+                    let i = (y * width + x) as u32;
+                    fb[(y as u32 * 2048 + x as u32) as usize] =
+                        0x1234_5600u32 | (1 + (i % 0xFE));
+                }
+            }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                for y in 0..height {
+                    for x in 0..width {
+                        let idx = (y as u32 * 2048 + x as u32) as usize;
+                        dst[idx] = src[idx];
+                    }
+                }
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_XYENDI,   xy(width - 1, height - 1));
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+        };
+
+        let words = (words_per_pixel_row as i32 * height) as usize;
+        let read_all_words = |rex: &Rex3| -> Vec<u32> {
+            let mut out = Vec::with_capacity(words);
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            for i in 0..words {
+                out.push(if i == words - 1 { read_hostrw32_last(rex) } else { read_hostrw32(rex) });
+            }
+            out
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        let words_interp = read_all_words(rex_i);
+
+        // Pre-warm: throwaway pass over the same primitive shape forces the JIT
+        // shader to be fully compiled *before* the real comparison pass, so
+        // every GO below dispatches via JIT from word 0 — reproducing the "already
+        // compiled by the time the real primitive runs" end state deterministically
+        // instead of relying on racy mid-primitive compile timing.
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let _ = read_all_words(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0),
+                "JIT compile failed dm0={DM0_READ_BLOCK:#010x} dm1={dm1:#010x}");
+        }
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let words_jit = read_all_words(rex_j);
+
+        assert_eq!(words_interp, words_jit,
+            "HOSTR stress ({width}x{height}, dm1={dm1:#010x}) JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    #[test]
+    fn jit_hostr_ci8_stress_large_block() {
+        // 32px wide / 4px-per-word = 8 words/row, 20 rows = 160 words, 20 row-wraps.
+        hostr_stress(DM1_CI8_HOSTRW, 32, 20, 8);
+    }
+
+    #[test]
+    fn jit_hostr_ci8_stress_odd_width_block() {
+        // Odd width: rows don't divide evenly into words, so every row-wrap also
+        // lands mid-word (ceil(17/4) = 5 words/row, last word only 1 valid pixel).
+        hostr_stress(DM1_CI8_HOSTRW, 17, 11, 5);
+    }
+
+    /// Companion to jit_hostr_ci8_stress_odd_width_block: hostr_stress only checks
+    /// interp == JIT, which would pass even if BOTH engines packed a partial word
+    /// wrong the same way. This independently verifies against the fill pattern
+    /// that each row's trailing partial word (1 of 4 CI8 slots valid, 17 % 4 == 1)
+    /// is packed MSB-first with the unfilled low bytes zeroed — same layout
+    /// test_hostr_ci8_partial_word verifies for a single row, checked here across
+    /// every row-wrap in a multirow block for both interp and (pre-warmed) JIT.
+    #[test]
+    fn jit_hostr_ci8_partial_word_alignment_multirow() {
+        let (width, height): (i32, i32) = (17, 6);
+        let words_per_row = 5usize; // ceil(17/4)
+        let dm1 = DM1_CI8_HOSTRW;
+
+        // Same fill formula as hostr_stress: distinct, nonzero low byte per pixel.
+        let pixel_at = |x: i32, y: i32| -> u32 {
+            let i = (y * width + x) as u32;
+            1 + (i % 0xFE)
+        };
+
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for y in 0..height {
+                for x in 0..width {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = 0x1234_5600 | pixel_at(x, y);
+                }
+            }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                for y in 0..height {
+                    for x in 0..width {
+                        let idx = (y as u32 * 2048 + x as u32) as usize;
+                        dst[idx] = src[idx];
+                    }
+                }
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_XYENDI,   xy(width - 1, height - 1));
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+        };
+
+        let words = words_per_row * height as usize;
+        let read_all_words = |rex: &Rex3| -> Vec<u32> {
+            let mut out = Vec::with_capacity(words);
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            for i in 0..words {
+                out.push(if i == words - 1 { read_hostrw32_last(rex) } else { read_hostrw32(rex) });
+            }
+            out
+        };
+
+        let check_alignment = |words: &[u32], engine: &str| {
+            for y in 0..height as usize {
+                let row = &words[y * words_per_row..(y + 1) * words_per_row];
+                // Full words: 4 valid CI8 pixels each, MSB-first.
+                for (wi, &w) in row[..words_per_row - 1].iter().enumerate() {
+                    for slot in 0..4 {
+                        let x = (wi * 4 + slot) as i32;
+                        let got = (w >> (24 - 8 * slot)) & 0xFF;
+                        assert_eq!(got, pixel_at(x, y as i32),
+                            "{engine}: y={y} word={wi} slot={slot}: got {got:#04x}");
+                    }
+                }
+                // Trailing partial word: 17 % 4 == 1 valid pixel at x=16, must sit
+                // at the MSB byte with the remaining 3 bytes zero-padded (mirrors
+                // flush_host_pixel's left-shift-to-MSB / emit_shader's
+                // flushed_shifter padding — packing is LSB-to-MSB as slots fill,
+                // so a lone pixel must end up shifted all the way to the top).
+                let last = row[words_per_row - 1];
+                let expected_pixel = pixel_at(16, y as i32);
+                assert_eq!((last >> 24) & 0xFF, expected_pixel,
+                    "{engine}: y={y} partial word MSB byte: got {:#04x} expected {expected_pixel:#04x} (word={last:#010x})",
+                    (last >> 24) & 0xFF);
+                assert_eq!(last & 0x00FF_FFFF, 0,
+                    "{engine}: y={y} partial word low 3 bytes should be zero-padded, got {:#08x}", last & 0x00FF_FFFF);
+            }
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        let words_interp = read_all_words(rex_i);
+        check_alignment(&words_interp, "interp");
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let _ = read_all_words(rex_j); // throwaway: triggers compile request
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0),
+                "JIT compile failed dm0={DM0_READ_BLOCK:#010x} dm1={dm1:#010x}");
+        }
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let words_jit = read_all_words(rex_j);
+        check_alignment(&words_jit, "jit");
+    }
+
+    #[test]
+    fn jit_hostr_rgb24_stress_large_block() {
+        // RGB24 hostdepth32: 1 pixel/word, so this is 24 rows x 15 words = 360 row-wraps' worth.
+        hostr_stress(DM1_RGB24_HOSTRW, 15, 24, 15);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GFifo ring buffer tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod gfifo_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Helper: construct a standalone GFifo (not attached to a Rex3).
+    /// Uses Arc::new_zeroed to heap-allocate without touching the stack.
+    fn make_gfifo() -> Arc<GFifo> {
+        unsafe { Arc::new_zeroed().assume_init() }
+    }
+
+    /// SPSC: one producer thread pushes N items, one consumer thread pops them.
+    /// Verifies ordering, value integrity, and that the queue drains completely.
+    #[test]
+    fn gfifo_spsc() {
+        const N: u64 = 4096;
+        let q = make_gfifo();
+
+        let qp = q.clone();
+        let producer = thread::spawn(move || {
+            for i in 0..N {
+                qp.push(i as u32, i.wrapping_mul(0xDEAD_BEEF_0000_0001));
+            }
+        });
+
+        let qc = q.clone();
+        let consumer = thread::spawn(move || {
+            let mut received = 0u64;
+            while received < N {
+                if let Some((addr, val)) = qc.peek().map(|e| { qc.consume(); e }) {
+                    assert_eq!(addr as u64, received,
+                        "wrong addr at position {received}: got {addr}");
+                    assert_eq!(val, received.wrapping_mul(0xDEAD_BEEF_0000_0001),
+                        "wrong val at position {received}: got {val:#x}");
+                    received += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            // Queue must be empty after draining all items.
+            assert!(qc.is_empty(), "queue not empty after full drain");
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    }
+
+    /// MPSC: multiple producer threads push disjoint ranges; one consumer collects
+    /// all values and verifies every expected value arrived exactly once.
+    #[test]
+    fn gfifo_mpsc() {
+        const PRODUCERS: u32 = 4;
+        const PER_PRODUCER: u32 = 1024;
+        const TOTAL: u32 = PRODUCERS * PER_PRODUCER;
+
+        let q = make_gfifo();
+
+        // Each producer pushes addr = producer_id * PER_PRODUCER + i, val = addr as u64.
+        let producers: Vec<_> = (0..PRODUCERS).map(|pid| {
+            let qp = q.clone();
+            thread::spawn(move || {
+                let base = pid * PER_PRODUCER;
+                for i in 0..PER_PRODUCER {
+                    let v = base + i;
+                    qp.push(v, v as u64);
+                }
+            })
+        }).collect();
+
+        let qc = q.clone();
+        let consumer = thread::spawn(move || {
+            let mut seen = vec![false; TOTAL as usize];
+            let mut count = 0u32;
+            while count < TOTAL {
+                if let Some((addr, val)) = qc.peek().map(|e| { qc.consume(); e }) {
+                    assert!((addr as usize) < TOTAL as usize,
+                        "addr {addr} out of range");
+                    assert_eq!(val, addr as u64,
+                        "val mismatch for addr {addr}: got {val}");
+                    assert!(!seen[addr as usize],
+                        "duplicate entry for addr {addr}");
+                    seen[addr as usize] = true;
+                    count += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            assert!(qc.is_empty(), "queue not empty after full drain");
+            // Every slot must have been seen exactly once.
+            assert!(seen.iter().all(|&s| s), "some entries were never received");
+        });
+
+        for p in producers { p.join().unwrap(); }
+        consumer.join().unwrap();
+    }
+}
+
