@@ -23,3 +23,8 @@ IRIS.app/
 # but deliberately checked in — building the suite must need nothing but the
 # MIPS cross toolchain.
 bench/build/
+
+# COW overlays and per-machine NVRAM produced at runtime
+*.overlay
+*.overlay.dirty
+nvram-*.bin
