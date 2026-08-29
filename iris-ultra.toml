@@ -1,0 +1,25 @@
+# Mirrors the GUI machine "indy-2", for the CLI build with jitv2.
+headless   = false
+no_audio   = false
+banks      = [128, 128, 128, 128]   # 512 MB, same as indy-2
+nvram      = "nvram-ultra.bin"
+serial_log = "boot-test.log"
+scale      = 1
+
+[machine]
+profile = "indy_ip24"
+cpu     = "r5000"                   # same as indy-2; try r4400 to compare
+
+[scsi.1]
+path    = "ultra.raw"
+cdrom   = false
+overlay = true                      # writes go to ultra.raw.overlay; base stays clean
+
+[vino]
+source = "off"
+
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
