@@ -3,6 +3,17 @@ Me and my homies Claude and Gemini present:
 
 # IRIS — Irresponsible Rust IRIX Simulator
 
+> **This is a fork.** Upstream is
+> [techomancer/iris](https://github.com/techomancer/iris) by Dominik Behr and
+> contributors; this repository tracks it for local experiments (performance
+> work, build/packaging fixes) and carries no authority over the project.
+> Licensing is unchanged — BSD 3-Clause, see [LICENSE](LICENSE).
+>
+> **Report bugs upstream**, not here: issues found in IRIS itself belong in
+> [techomancer/iris](https://github.com/techomancer/iris/issues), where the
+> people who can fix them will see them. Only fork-specific changes belong in
+> this tracker.
+
 An SGI Indy / Indigo2 emulator, vibed into existence with Rust and AI assistance.
 Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
 
