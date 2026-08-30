@@ -75,6 +75,98 @@ boots to a usable system: shell, networking, X11, the works.
 - NetBSD shows a white screen and probably goes into the weeds
 
 
+## What this fork adds
+
+Everything in this section is fork-only and not upstream. The rest of this
+README is upstream's.
+
+### JIT coverage measurement (`j2 status`)
+
+`docs/jitv2_performance_analysis.md` ranks "add a JIT-coverage counter before
+touching anything else" first, at 95% confidence, because the engine could not
+answer its most basic question: **of everything the guest retires, how much
+actually runs as compiled code?** It now can:
+
+```
+coverage: 59.38% of retired instructions ran compiled (14592940280 of 24576205518)
+  dispatches: 2066777980, mean 7.1 instructions per region entry
+  exits: complete 2043452010 (98.9%), fallback 23325970 (1.1%)
+  regions walked: 32646, mean 37.7 instructions (static, compile-weighted)
+  region ends: reg-jump 46.9%, page-leaving 38.9%, truncated 10.0%,
+               excluded 3.8%, foreign-page-slot 0.4%
+```
+
+Coverage is sampled as the delta of `core.hot.cycles` across each artifact
+call — that counter already advances once per instruction in *both* engines, so
+no codegen change was needed and the cost is two loads and two adds per region
+entry, not per instruction. The region-end histogram aggregates the
+`StopReason` the analyzer already recorded on every edge and nobody read back.
+
+`j2 status` reads through the executor, so **run `stop` first** (and `start`
+after) — on a busy CPU it fails with `CPU thread holds the executor lock`. An
+idle-parked desktop answers anyway, which makes that look intermittent.
+
+### What it found
+
+Measured on a live IRIX desktop, not a benchmark. Full write-up, with the
+confounds, in
+[`rules/perf/jit-coverage-on-live-irix.md`](rules/perf/jit-coverage-on-live-irix.md).
+
+- **Bare-metal and boot workloads overstate coverage badly.** Boot to login
+  measures 83% coverage at 29.4 instructions per region entry; the same session
+  at a working desktop measures 59% at 7.1. Boot is long straight-line loops;
+  a desktop is calls and returns.
+- **Regions are short, not broken.** 98.9% of dispatches return `complete` —
+  no exception, no retry, no bail. They simply end after ~7 instructions, two
+  billion times, each paying a dispatcher round-trip.
+- **Region admission is not the lever.** `Excluded` — the `CACHE`/`LL`/`SC`
+  boundary that R3 would relax — is **3.8%** of region terminations.
+  `RegJump` + `PageLeaving` are **85.8%**: control transfer the analyzer cannot
+  follow statically. Block chaining and indirect-jump/return handling are where
+  the headroom is.
+- **The compile budget was costing 10-14% of region terminations.**
+  `MAX_INSTRS_PER_COMPILE` defaults to 128 and `StopReason::Truncated`'s doc
+  comment claimed the real compiler never produces it. It does. An A/B with
+  identical treatment on both arms measured 128 -> 1024 as worth **+6.35 points
+  of coverage and +40% on executed region length**:
+
+  | | 128 | 1024 |
+  |---|---:|---:|
+  | coverage | 55.27% | **61.62%** |
+  | dynamic mean instrs/entry | 5.61 | **7.87** |
+  | truncation share | 14.0% | 0.0% |
+
+  Tunable at runtime, no rebuild — `j2 max-instrs 1024` then `j2 flush`. The
+  default is left at 128: this is one run on one host with an uncontrolled
+  workload, and the compile-latency cost was never timed. It wants repeating
+  before anyone changes a default for everyone.
+
+### `tools/chd2raw.py`
+
+`libchdman-rs` 0.289 (behind `--features chd`) rejects **uncompressed** CHD v5
+with `InvalidFile` — which is exactly what this repo's own documented recipe,
+`chdman createhd ... -c none`, produces. Compressed CHDs open fine. This
+converts such an image to a sparse raw one, which iris reads natively with no
+cargo feature and which still supports `overlay = true`. A 14.8 GB disk holding
+1.7 GB of live data converts to 1.7 GB on disk.
+
+### Measured on the development host
+
+Mac Pro (Late 2013), Xeon E5-1620 v2 (4c/8t, 3.7 GHz), macOS 12.7.6, built with
+`--features lightning,rex-jit,jitv2` and `RUSTFLAGS="-C target-cpu=native"`
+(worth +avx +sse4.2 +popcnt over Rust's SSE2 baseline on this CPU):
+
+| cell | guest MIPS | accuracy |
+|---|---:|---:|
+| r4400 + jitv2 | 200-285 | 100% (40/40) |
+| r5000 + jitv2 | 240-290 | 100% (40/40) |
+
+R5000 wins big on memory-streaming kernels (`mem/stream_copy` 14.6 -> 137.8
+MIPS) because `Config.SC=1` bypasses the emulated L2 entirely; R4400 wins on
+branchy scalar code. Interactive desktop reads 58-100 MIPS, lower because the
+CPU idle-parks — that is the emulator correctly not burning a core.
+
+
 ## Getting started
 
 Super easy mode -> Thanks to Dani we have Windows/Mac/Linux builds at https://github.com/danifunker/iris/releases
