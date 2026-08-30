@@ -337,11 +337,94 @@ pub enum StopReason {
     /// runtime state correctly regardless of which page armed it.
     ForeignPageSlot,
     /// The walk's instruction budget (`Analyzer::walk_bounded`) ran out
-    /// before this edge's target could be visited. Test/tooling scaffolding
-    /// only — the unbounded `Analyzer::walk` used by the real compiler never
-    /// produces this. Distinct from `Excluded` so callers can't mistake
-    /// "asked for a small region on purpose" for a genuine exclusion boundary.
+    /// before this edge's target could be visited. Distinct from `Excluded`
+    /// so callers can't mistake "asked for a small region on purpose" for a
+    /// genuine exclusion boundary.
+    ///
+    /// This was documented as "test/tooling scaffolding only — the real
+    /// compiler never produces this", which is false: `comp.rs` compiles via
+    /// `walk_bounded` against `MAX_INSTRS_PER_COMPILE` (default 128), not the
+    /// unbounded `walk`. Measured on a live IRIX desktop, this is **10% of all
+    /// region terminations** — the third-largest cause, ahead of `Excluded`.
+    /// See `rules/perf/jit-coverage-on-live-irix.md`. `j2 max-instrs [N]`
+    /// tunes the budget at runtime, so the cost of that ceiling is measurable
+    /// without a rebuild.
     Truncated,
+}
+
+impl StopReason {
+    /// Number of variants — the width of [`STOP_REASON_COUNTS`].
+    pub const COUNT: usize = 5;
+
+    /// Display names, indexed by [`Self::index`].
+    pub const NAMES: [&'static str; Self::COUNT] =
+        ["page-leaving", "reg-jump", "excluded", "foreign-page-slot", "truncated"];
+
+    /// Dense index for histogram bucketing.
+    pub fn index(self) -> usize {
+        match self {
+            Self::PageLeaving => 0,
+            Self::RegJump => 1,
+            Self::Excluded => 2,
+            Self::ForeignPageSlot => 3,
+            Self::Truncated => 4,
+        }
+    }
+}
+
+/// Why compiled regions stop growing, aggregated over every region the
+/// compile thread walks (R0.5). `j2 status` prints it.
+///
+/// The motivating measurement: on a live IRIX desktop, regions average ~7
+/// instructions and 98.9% of dispatches return `complete` — regions are not
+/// failing, they are simply short (`rules/perf/jit-coverage-on-live-irix.md`).
+/// The exit buckets in `j2 status` say how compiled code *left*; this says why
+/// the analyzer stopped *walking*, which is the half that names a fix:
+/// `Excluded` argues for admission with interpreter fallback, `RegJump` for
+/// indirect-jump/return handling, `PageLeaving` for cross-page linking.
+///
+/// Process-global statics rather than fields on `JitStats`, following
+/// `LOCKSTEP_VERIFICATIONS`' precedent: the compile thread reaches these
+/// without `JitStats` in scope outside `developer` builds, and there is one
+/// jitv2 engine per process anyway. Updated once per walked region on the
+/// compile thread — nowhere near a hot path.
+pub static STOP_REASON_COUNTS: [std::sync::atomic::AtomicU64; StopReason::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Regions successfully walked, and the total instructions in them — the
+/// denominator and numerator of the *static* mean region length.
+///
+/// Static, i.e. weighted by compiles, not by executions: a region compiled
+/// once and never re-entered counts the same as the hot loop underneath
+/// everything. Compare against `j2 status`'s dynamic "mean instructions per
+/// region entry", which is execution-weighted. A large gap between the two is
+/// itself the finding — it means the short regions are the ones actually being
+/// run.
+pub static REGIONS_WALKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static REGION_INSTRS_WALKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Tally one successfully walked region into the R0.5 counters.
+///
+/// Counts every *edge* that leaves the region, so an instruction whose taken
+/// and fallthrough arms both exit contributes two — the question being "what
+/// terminates region growth", and each edge is one such termination.
+pub fn record_region_shape(instrs: &[CompiledInstr; ENTRIES_PER_PAGE]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut n = 0u64;
+    for i in instrs_linear(instrs) {
+        n += 1;
+        for reason in [i.fallthrough_exit, i.taken_exit].into_iter().flatten() {
+            STOP_REASON_COUNTS[reason.index()].fetch_add(1, Relaxed);
+        }
+    }
+    REGIONS_WALKED.fetch_add(1, Relaxed);
+    REGION_INSTRS_WALKED.fetch_add(n, Relaxed);
 }
 
 /// One slot in the per-page compile record array (§2.3/§6.1.2's "one

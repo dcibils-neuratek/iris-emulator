@@ -11904,6 +11904,33 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                     .join(", ");
                                 writeln!(writer, "  exits: {}", exits).unwrap();
                             }
+                            // R0.5: the other half of the question. `exits`
+                            // says how compiled code left; this says why the
+                            // analyzer stopped growing the region in the first
+                            // place, which is what names a fix.
+                            let walked = crate::jitv2::analyzer::REGIONS_WALKED
+                                .load(Ordering::Relaxed);
+                            if walked > 0 {
+                                let winstrs = crate::jitv2::analyzer::REGION_INSTRS_WALKED
+                                    .load(Ordering::Relaxed);
+                                let edges: u64 = crate::jitv2::analyzer::STOP_REASON_COUNTS
+                                    .iter().map(|c| c.load(Ordering::Relaxed)).sum();
+                                writeln!(writer, "  regions walked: {}, mean {:.1} instructions (static, compile-weighted)",
+                                    walked, winstrs as f64 / walked as f64).unwrap();
+                                let mut reasons = crate::jitv2::analyzer::STOP_REASON_COUNTS
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, c)| (c.load(Ordering::Relaxed), crate::jitv2::analyzer::StopReason::NAMES[i]))
+                                    .filter(|(n, _)| *n > 0)
+                                    .collect::<Vec<_>>();
+                                reasons.sort_by(|a, b| b.0.cmp(&a.0)); // dominant cause first
+                                let why = reasons.iter()
+                                    .map(|(n, name)| format!("{} {} ({:.1}%)", name, n,
+                                        *n as f64 * 100.0 / edges.max(1) as f64))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                writeln!(writer, "  region ends: {}", why).unwrap();
+                            }
                         }
                         #[cfg(feature = "developer")]
                         {

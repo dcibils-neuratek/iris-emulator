@@ -200,6 +200,10 @@ pub fn handle_request(
     dump_corpus_snapshot(page, req.offset, &words);
 
     let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, max_instrs_per_compile());
+    if non_empty {
+        // R0.5: why does region growth stop? See `record_region_shape`.
+        crate::jitv2::analyzer::record_region_shape(instrs);
+    }
     if !non_empty {
         page.denylist(offset); // entry offset itself is excluded (§6.4)
         #[cfg(feature = "developer")]
@@ -419,6 +423,10 @@ pub fn handle_request_deferred(
     dump_corpus_snapshot(page, req.offset, &words);
 
     let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, max_instrs_per_compile());
+    if non_empty {
+        // R0.5: why does region growth stop? See `record_region_shape`.
+        crate::jitv2::analyzer::record_region_shape(instrs);
+    }
     if !non_empty {
         page.denylist(offset);
         #[cfg(feature = "developer")]
