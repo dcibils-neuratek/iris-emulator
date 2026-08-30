@@ -95,3 +95,61 @@ guest for as long as you take; it resumes cleanly on `start`.
 - "Desktop session" here included Software Manager, `winterm`, `jot` and a
   console — interactive and I/O-heavy, not a compute workload. A build or a
   demo would likely look different, possibly much better.
+
+---
+
+# Follow-up: why regions stop growing (R0.5), and the compile budget
+
+`j2 status` now also reports why the analyzer stopped walking. Measured on the
+same live desktop:
+
+```
+region ends: reg-jump 46.9%, page-leaving 38.9%, truncated 10.0%,
+             excluded 3.8%, foreign-page-slot 0.4%
+```
+
+**`Excluded` is 3.8%.** Region admission (R3) — letting `CACHE`/`LL`/`SC` be
+compiled with interpreter fallback instead of ending the region — addresses
+under 4% of region terminations on real work. It is not the lever, despite
+being the obvious candidate and despite this file's first half arguing for it.
+
+**`RegJump` + `PageLeaving` = 85.8%** — both are the same thing: a control
+transfer the analyzer cannot follow statically (`jr ra` returns, calls off the
+page). That is what block chaining and an indirect-jump inline cache or
+return-address stack would attack, and it is the only thing on this list big
+enough to matter.
+
+**Static vs dynamic mean is itself a finding.** Regions walk to ~38-41
+instructions on average, but the regions *executed* average 7-15. The short
+ones are the hot ones; long regions compile and are rarely re-entered.
+
+## The compile budget was cutting 10-14% of regions
+
+`Truncated` should not have appeared at all — `StopReason::Truncated`'s doc
+comment claimed the real compiler never produces it. False: `comp.rs` compiles
+through `walk_bounded` against `MAX_INSTRS_PER_COMPILE`, default **128**.
+
+`j2 max-instrs [N]` tunes it at runtime, so this is measurable without a
+rebuild. A/B on the live desktop, both arms given identical treatment (set
+value, `j2 flush`, discard the re-warm, then an equal-length window):
+
+| | 128 | 1024 |
+|---|---:|---:|
+| coverage | 55.27% | **61.62%** |
+| dynamic mean instrs/entry | 5.61 | **7.87** |
+| truncation share of region ends | 14.0% | 0.0% |
+| guest instructions in window | 6.23 B | 5.71 B |
+
++6.35 points of coverage and +40% on executed region length, from a one-line
+default.
+
+**Confounds, stated plainly:** desktop activity was not controlled between
+arms; arm A walked 32,397 regions against arm B's 4,552, so the two windows
+were not doing identical work; single run, no repeats. The direction matches
+the mechanism (no truncation -> longer regions -> more coverage) and the effect
+is large, but this wants repeating before the default is changed upstream.
+
+Not measured: the cost side. Larger regions mean larger Cranelift functions,
+slower compiles and more arena bytes each. Neither `pages used` (~2300-2500 of
+4096) nor mega-flushes (0 during the runs, 1 manual) moved alarmingly, but
+compile latency was never timed.
