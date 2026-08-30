@@ -795,6 +795,41 @@ pub const EXEC_RETRY:              ExecStatus = 0x0000_0100; // bus busy, retry 
 pub const EXEC_FALLBACK:           ExecStatus = 0x0000_0200; // jitv2+lightning's decode-skip fast path missed; caller must decode and dispatch normally
 pub const EXEC_BREAKPOINT:         ExecStatus = 0x0000_0800; // breakpoint hit
 
+/// Why a jitv2 artifact handed control back, as a small dense index — see
+/// [`jit_exit_bucket`] and `MipsExecutor::jit_exits`. Kept coarse on purpose:
+/// this answers "are regions running to completion, or bailing, and why",
+/// which is the question `docs/jitv2_performance_analysis.md`'s R0 asks before
+/// deciding whether the next win is region admission or per-instruction
+/// overhead. A finer split (per exception code) belongs in `j2 instrs`.
+#[cfg(feature = "jitv2")]
+pub const JIT_EXIT_BUCKETS: usize = 5;
+
+/// Display names for [`JIT_EXIT_BUCKETS`], indexed by [`jit_exit_bucket`].
+#[cfg(feature = "jitv2")]
+pub const JIT_EXIT_NAMES: [&str; JIT_EXIT_BUCKETS] =
+    ["complete", "fallback", "exception", "retry", "breakpoint"];
+
+/// Classify an artifact's return status into a [`JIT_EXIT_BUCKETS`] index.
+///
+/// Exception is tested first because `EXEC_IS_EXCEPTION` is a *flag* ORed with
+/// the exception code, so an exception status is never equal to any of the
+/// plain constants below it.
+#[cfg(feature = "jitv2")]
+#[inline(always)]
+pub fn jit_exit_bucket(status: ExecStatus) -> usize {
+    if status & EXEC_IS_EXCEPTION != 0 {
+        2
+    } else if status == EXEC_FALLBACK {
+        1
+    } else if status == EXEC_RETRY {
+        3
+    } else if status == EXEC_BREAKPOINT {
+        4
+    } else {
+        0
+    }
+}
+
 /// `jitv2_lockstep`: sentinel `bd` value passed to `lockstep_step_fn` meaning
 /// "trust the live `core.pc`/`core.in_delay_slot`/`delay_slot_target` — do NOT
 /// overwrite them from the compile-time constants." Codegen passes it for an
@@ -1179,6 +1214,33 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// just to read this field.
     #[cfg(feature = "jitv2")]
     pub jitv2_stats: std::sync::Arc<crate::jitv2::JitStats>,
+    /// Guest instructions retired *inside* compiled code — the numerator of
+    /// the JIT coverage ratio (`docs/jitv2_performance_analysis.md` R0, the
+    /// measurement that decides whether effort belongs in region admission or
+    /// in per-instruction overhead).
+    ///
+    /// Sampled as the delta of `core.hot.cycles` across each artifact call.
+    /// That counter is already incremented once per instruction by whichever
+    /// engine retires it (see `Hot::cycles`), so the delta *is* the compiled
+    /// engine's share exactly — no per-instruction instrumentation, no codegen
+    /// change, and nothing to keep in sync with the emitters. The whole cost is
+    /// two loads and two adds per region entry, not per instruction.
+    ///
+    /// Plain `u64` rather than an atomic in `JitStats`: the CPU thread is the
+    /// only writer, and `j2 status` reads it while holding the executor lock it
+    /// already takes. Wrapping arithmetic throughout — these are diagnostic
+    /// counters and a wrap is meaningless, not a bug worth a panic in release.
+    #[cfg(feature = "jitv2")]
+    pub jit_instrs: u64,
+    /// Artifact invocations accounted into [`Self::jit_instrs`]. Denominator
+    /// for mean region length; zero here is the unambiguous "no compiled code
+    /// has ever run" signal, which is a different failure from "compiled code
+    /// ran and covered little".
+    #[cfg(feature = "jitv2")]
+    pub jit_dispatches: u64,
+    /// How those invocations ended, indexed by [`jit_exit_bucket`].
+    #[cfg(feature = "jitv2")]
+    pub jit_exits: [u64; JIT_EXIT_BUCKETS],
 
     /// Coverage of the JIT's inline load/store path (feature = "jitstats").
     /// Populated on every cached data access; printed at exit.
@@ -2357,6 +2419,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_stats,
             #[cfg(feature = "jitv2")]
+            jit_instrs: 0,
+            #[cfg(feature = "jitv2")]
+            jit_dispatches: 0,
+            #[cfg(feature = "jitv2")]
+            jit_exits: [0; JIT_EXIT_BUCKETS],
+            #[cfg(feature = "jitv2")]
             pcp: std::ptr::null_mut(),
             #[cfg(feature = "jitv2_lockstep")]
             ls_before: None,
@@ -3171,6 +3239,32 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// directly — exactly when something (a gate miss, a pending interrupt
     /// caught inline) actually needs the interpreter's real preamble.
     /// Full dispatch-gate rationale: rules/jitv2/jit-v2-design.md §13.
+    /// Call a published jitv2 artifact, accounting what it retired.
+    ///
+    /// The single place compiled code is entered, so that JIT coverage can be
+    /// measured without touching codegen: `core.hot.cycles` advances once per
+    /// instruction in *both* engines, so its delta across the call is exactly
+    /// the number of instructions this artifact retired. Two loads and two
+    /// adds per region entry — amortized over every instruction the region
+    /// runs — which is why this is not gated behind `developer` the way the
+    /// per-dispatch compile-queue counters are.
+    ///
+    /// SAFETY: `jit_fn` must be a live artifact for the page the executor is
+    /// currently positioned in — i.e. `is_runnable` was checked against the
+    /// current generation. Same contract as the raw call it replaces.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    unsafe fn run_jit_artifact(&mut self, jit_fn: crate::jitv2::JitFn) -> ExecStatus {
+        let before = self.core.hot.cycles;
+        let status = jit_fn(&mut self.core as *mut MipsCore);
+        self.jit_instrs = self
+            .jit_instrs
+            .wrapping_add(self.core.hot.cycles.wrapping_sub(before));
+        self.jit_dispatches = self.jit_dispatches.wrapping_add(1);
+        self.jit_exits[jit_exit_bucket(status)] += 1;
+        status
+    }
+
     #[cfg(feature = "jitv2")]
     pub fn step_jit(&mut self) -> ExecStatus {
         let pc = self.core.pc;
@@ -3203,7 +3297,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                     #[cfg(feature = "j2wp")]
                     { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                     let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
-                    let status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
+                    let status = unsafe { self.run_jit_artifact(jit_fn) };
                     break 'gate if status != EXEC_FALLBACK { status } else { self.step_int() };
                 }
                 let inline_compile = self.jitv2_inline_compile;
@@ -7482,7 +7576,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "j2wp")]
             { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
-            let status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
+            let status = unsafe { self.run_jit_artifact(jit_fn) };
             if status != EXEC_FALLBACK {
                 status
             } else {
@@ -11776,6 +11870,41 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         }
                         #[cfg(not(feature = "jitv2_lockstep"))]
                         writeln!(writer, "inline compile: {}", if exec.jitv2_inline_compile { "on" } else { "off" }).unwrap();
+                        // JIT coverage (R0). The first question to ask of this
+                        // engine and, until now, the one number it could not
+                        // answer: of everything the guest retired, how much ran
+                        // as compiled code? Low coverage means the win is in
+                        // admission (why regions are not being compiled or are
+                        // being cut short); high coverage with modest speedup
+                        // means it is in per-instruction overhead. The exit
+                        // histogram distinguishes the two directly.
+                        {
+                            let total = exec.core.hot.cycles;
+                            let jitted = exec.jit_instrs;
+                            if exec.jit_dispatches == 0 {
+                                writeln!(writer, "coverage: 0% — no compiled code has run \
+                                    (nothing published yet, or `j2 dispatch` is off)").unwrap();
+                            } else {
+                                // `jitted` is sampled per artifact call and `total` is
+                                // read live, so the ratio can only understate coverage
+                                // (never exceed 100%) — no clamping needed.
+                                let pct = jitted as f64 * 100.0 / total.max(1) as f64;
+                                writeln!(writer, "coverage: {:.2}% of retired instructions ran compiled ({} of {})",
+                                    pct, jitted, total).unwrap();
+                                writeln!(writer, "  dispatches: {}, mean {:.1} instructions per region entry",
+                                    exec.jit_dispatches,
+                                    jitted as f64 / exec.jit_dispatches as f64).unwrap();
+                                let exits = crate::mips_exec::JIT_EXIT_NAMES
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| exec.jit_exits[*i] > 0)
+                                    .map(|(i, name)| format!("{} {} ({:.1}%)", name, exec.jit_exits[i],
+                                        exec.jit_exits[i] as f64 * 100.0 / exec.jit_dispatches as f64))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                writeln!(writer, "  exits: {}", exits).unwrap();
+                            }
+                        }
                         #[cfg(feature = "developer")]
                         {
                             let dt_calls = crate::mips_exec::DEV_TRACE_BP_CALLS.load(Ordering::Relaxed);
